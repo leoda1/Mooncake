@@ -19,9 +19,18 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <limits>
+#include <memory>
 #include <sstream>
 #include <strings.h>
+#include <type_traits>
 #include <unistd.h>
+
+#if __has_include(<jsoncpp/json/json.h>)
+#include <jsoncpp/json/json.h>
+#else
+#include <json/json.h>
+#endif
 
 namespace mooncake {
 namespace {
@@ -56,6 +65,105 @@ bool parseBoolConfigEnv(const char* value, const char* env_name, bool& output) {
     LOG(WARNING) << "Ignore value from environment variable " << env_name
                  << ", it should be 0|1|true|false";
     return false;
+}
+
+template <typename T>
+bool parseUnsignedConfigEnv(const char* value, const char* env_name, T minimum,
+                            T maximum, T& output) {
+    static_assert(std::is_unsigned_v<T>);
+    T parsed = 0;
+    const char* end = value + strlen(value);
+    auto [ptr, ec] = std::from_chars(value, end, parsed);
+    if (ec != std::errc() || ptr != end || parsed < minimum ||
+        parsed > maximum) {
+        LOG(WARNING) << "Invalid " << env_name
+                     << " environment value: " << value;
+        return false;
+    }
+    output = parsed;
+    return true;
+}
+
+bool isValidPxnGroupId(const std::string& group_id) {
+    if (group_id.empty() || group_id.size() > 64 || group_id == "." ||
+        group_id == "..") {
+        return false;
+    }
+    for (unsigned char c : group_id) {
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.') {
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+bool isValidPxnRailEntry(const std::string& raw, const std::string& canonical) {
+    return !raw.empty() && raw.size() <= 255 && !canonical.empty() &&
+           canonical.size() <= 255;
+}
+
+bool isValidPxnRailMap(
+    const std::unordered_map<std::string, std::string>& rail_map) {
+    for (const auto& [raw, canonical] : rail_map) {
+        if (!isValidPxnRailEntry(raw, canonical)) return false;
+    }
+    return true;
+}
+
+bool isValidPxnConfig(const GlobalConfig& config) {
+    return isValidPxnGroupId(config.pxn_group_id) &&
+           config.pxn_inflight_depth >= 1 && config.pxn_inflight_depth <= 64 &&
+           config.pxn_credit_timeout_ms > 0 &&
+           config.pxn_heartbeat_timeout_ms > 0 &&
+           isValidPxnRailMap(config.pxn_rail_map);
+}
+
+bool parsePxnRailMap(const char* value,
+                     std::unordered_map<std::string, std::string>& rail_map) {
+    if (value[0] == '\0') {
+        rail_map.clear();
+        return true;
+    }
+
+    try {
+        Json::CharReaderBuilder builder;
+        builder["allowComments"] = false;
+        builder["allowTrailingCommas"] = false;
+        builder["collectComments"] = false;
+        builder["failIfExtra"] = true;
+        builder["rejectDupKeys"] = true;
+        builder["strictRoot"] = true;
+        std::unique_ptr<Json::CharReader> reader(builder.newCharReader());
+        Json::Value root;
+        std::string error;
+        if (!reader->parse(value, value + strlen(value), &root, &error) ||
+            !root.isObject()) {
+            LOG(WARNING) << "Invalid MC_PXN_RAIL_MAP environment value";
+            return false;
+        }
+
+        std::unordered_map<std::string, std::string> parsed;
+        for (const auto& key : root.getMemberNames()) {
+            const auto& mapped = root[key];
+            if (!mapped.isString()) {
+                LOG(WARNING) << "Invalid MC_PXN_RAIL_MAP entry";
+                return false;
+            }
+            auto canonical = mapped.asString();
+            if (!isValidPxnRailEntry(key, canonical)) {
+                LOG(WARNING) << "Invalid MC_PXN_RAIL_MAP entry";
+                return false;
+            }
+            parsed.emplace(key, std::move(canonical));
+        }
+        rail_map = std::move(parsed);
+        return true;
+    } catch (const Json::Exception&) {
+        LOG(WARNING) << "Invalid MC_PXN_RAIL_MAP environment value";
+        return false;
+    }
 }
 
 void parseNicPeerAffinity(
@@ -388,6 +496,46 @@ void loadGlobalConfig(GlobalConfig& config) {
                             "value: "
                          << rdma_rail_pause_seconds << ". Error: " << e.what();
         }
+    }
+
+    bool pxn_config_valid = true;
+    if (const char* value = std::getenv("MC_PXN_ENABLE")) {
+        pxn_config_valid &=
+            parseBoolConfigEnv(value, "MC_PXN_ENABLE", config.pxn_enable);
+    }
+    if (const char* value = std::getenv("MC_PXN_GROUP_ID")) {
+        std::string group_id(value);
+        if (isValidPxnGroupId(group_id)) {
+            config.pxn_group_id = std::move(group_id);
+        } else {
+            LOG(WARNING) << "Invalid MC_PXN_GROUP_ID environment value";
+            pxn_config_valid = false;
+        }
+    }
+    if (const char* value = std::getenv("MC_PXN_INFLIGHT_DEPTH")) {
+        pxn_config_valid &=
+            parseUnsignedConfigEnv(value, "MC_PXN_INFLIGHT_DEPTH", size_t{1},
+                                   size_t{64}, config.pxn_inflight_depth);
+    }
+    if (const char* value = std::getenv("MC_PXN_CREDIT_TIMEOUT_MS")) {
+        pxn_config_valid &= parseUnsignedConfigEnv(
+            value, "MC_PXN_CREDIT_TIMEOUT_MS", uint32_t{1},
+            std::numeric_limits<uint32_t>::max(), config.pxn_credit_timeout_ms);
+    }
+    if (const char* value = std::getenv("MC_PXN_HEARTBEAT_TIMEOUT_MS")) {
+        pxn_config_valid &= parseUnsignedConfigEnv(
+            value, "MC_PXN_HEARTBEAT_TIMEOUT_MS", uint32_t{1},
+            std::numeric_limits<uint32_t>::max(),
+            config.pxn_heartbeat_timeout_ms);
+    }
+    if (const char* value = std::getenv("MC_PXN_RAIL_MAP")) {
+        if (!parsePxnRailMap(value, config.pxn_rail_map)) {
+            pxn_config_valid = false;
+        }
+    }
+    if (config.pxn_enable && (!pxn_config_valid || !isValidPxnConfig(config))) {
+        LOG(WARNING) << "PXN is disabled because its configuration is invalid";
+        config.pxn_enable = false;
     }
 
     const char* log_level = std::getenv("MC_LOG_LEVEL");
@@ -746,6 +894,12 @@ void dumpGlobalConfig() {
     LOG(INFO) << "te_metadata_refresh_interval_seconds = "
               << config.te_metadata_refresh_interval_seconds;
     LOG(INFO) << "rdma_rail_pause_seconds = " << config.rdma_rail_pause_seconds;
+    LOG(INFO) << "pxn_enable = " << (config.pxn_enable ? "true" : "false");
+    LOG(INFO) << "pxn_inflight_depth = " << config.pxn_inflight_depth;
+    LOG(INFO) << "pxn_credit_timeout_ms = " << config.pxn_credit_timeout_ms;
+    LOG(INFO) << "pxn_heartbeat_timeout_ms = "
+              << config.pxn_heartbeat_timeout_ms;
+    LOG(INFO) << "pxn_rail_map_size = " << config.pxn_rail_map.size();
     {
         std::ostringstream oss;
         for (size_t i = 0; i < config.mlx5_qp_udp_sports.size(); ++i) {

@@ -3,10 +3,12 @@ file(GLOB XPORT_SOURCES "*.cpp")
 add_subdirectory(rdma_transport)
 add_subdirectory(rdma_twosided)
 add_subdirectory(rpc_communicator)
+add_subdirectory(pxn)
 add_library(
   transport OBJECT
   ${XPORT_SOURCES} $<TARGET_OBJECTS:rdma_transport>
-  $<TARGET_OBJECTS:rdma_twosided> $<TARGET_OBJECTS:rpc_communicator>)
+  $<TARGET_OBJECTS:rdma_twosided> $<TARGET_OBJECTS:rpc_communicator>
+  $<TARGET_OBJECTS:pxn_transport>)
 target_link_libraries(
   transport PRIVATE JsonCpp::JsonCpp yalantinglibs::yalantinglibs glog::glog
                     pthread)

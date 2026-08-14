@@ -1,0 +1,1 @@
+add_library(pxn_transport OBJECT pxn_core.cpp)
