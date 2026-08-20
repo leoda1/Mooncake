@@ -32,6 +32,8 @@
 #include <json/json.h>
 #endif
 
+#include "transport/pxn/pxn_core.h"
+
 namespace mooncake {
 namespace {
 
@@ -84,21 +86,6 @@ bool parseUnsignedConfigEnv(const char* value, const char* env_name, T minimum,
     return true;
 }
 
-bool isValidPxnGroupId(const std::string& group_id) {
-    if (group_id.empty() || group_id.size() > 64 || group_id == "." ||
-        group_id == "..") {
-        return false;
-    }
-    for (unsigned char c : group_id) {
-        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-            (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.') {
-            continue;
-        }
-        return false;
-    }
-    return true;
-}
-
 bool isValidPxnRailEntry(const std::string& raw, const std::string& canonical) {
     return !raw.empty() && raw.size() <= 255 && !canonical.empty() &&
            canonical.size() <= 255;
@@ -113,7 +100,7 @@ bool isValidPxnRailMap(
 }
 
 bool isValidPxnConfig(const GlobalConfig& config) {
-    return isValidPxnGroupId(config.pxn_group_id) &&
+    return pxn::isValidGroupId(config.pxn_group_id) &&
            config.pxn_inflight_depth >= 1 && config.pxn_inflight_depth <= 64 &&
            config.pxn_credit_timeout_ms > 0 &&
            config.pxn_heartbeat_timeout_ms > 0 &&
@@ -505,7 +492,7 @@ void loadGlobalConfig(GlobalConfig& config) {
     }
     if (const char* value = std::getenv("MC_PXN_GROUP_ID")) {
         std::string group_id(value);
-        if (isValidPxnGroupId(group_id)) {
+        if (pxn::isValidGroupId(group_id)) {
             config.pxn_group_id = std::move(group_id);
         } else {
             LOG(WARNING) << "Invalid MC_PXN_GROUP_ID environment value";

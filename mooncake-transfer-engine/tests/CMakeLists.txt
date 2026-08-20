@@ -87,6 +87,14 @@ target_link_libraries(sender_credit_test PUBLIC transfer_engine gtest
                                                 gtest_main)
 add_test(NAME sender_credit_test COMMAND sender_credit_test)
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_executable(pxn_lifecycle_test ${WORKSPACE}/pxn_lifecycle_test.cpp)
+  target_link_libraries(pxn_lifecycle_test PUBLIC transfer_engine gtest
+                                                  gtest_main)
+  add_test(NAME pxn_lifecycle_test COMMAND pxn_lifecycle_test)
+  set_tests_properties(pxn_lifecycle_test PROPERTIES LABELS "pxn" TIMEOUT 30)
+endif()
+
 # This test verifies endpoint re-establishment in RDMATransport.
 add_executable(rdma_endpoint_reestablish_test
                ${WORKSPACE}/rdma_endpoint_reestablish_test.cpp)
