@@ -16,12 +16,17 @@
 #define MOONCAKE_TRANSFER_ENGINE_PXN_RDMA_TRANSPORT_H_
 
 #include <memory>
+#include <mutex>
+#include <unordered_map>
 
 #include "transport/rdma_transport/rdma_transport.h"
 
 namespace mooncake {
 namespace pxn {
 class LocalResources;
+class PxnPump;
+class RelayPipeline;
+class SenderLane;
 class SenderPipeline;
 }  // namespace pxn
 
@@ -32,14 +37,24 @@ class PxnRdmaTransport : public RdmaTransport {
     int install(std::string& local_server_name,
                 std::shared_ptr<TransferMetadata> metadata,
                 std::shared_ptr<Topology> topology) override;
+    Status submitTransferTask(
+        const std::vector<TransferTask*>& task_list) override;
 
     bool pxnReady() const {
-        return resources_ != nullptr && sender_pipeline_ != nullptr;
+        return resources_ != nullptr && sender_pipeline_ != nullptr &&
+               relay_pipeline_ != nullptr && pump_ != nullptr;
     }
 
    private:
+    bool selectPxnLane(const TransferRequest& request, std::string& session,
+                       pxn::SenderLane*& lane);
+
+    std::unique_ptr<pxn::PxnPump> pump_;
+    std::unique_ptr<pxn::RelayPipeline> relay_pipeline_;
     std::unique_ptr<pxn::SenderPipeline> sender_pipeline_;
     std::unique_ptr<pxn::LocalResources> resources_;
+    std::mutex peer_mutex_;
+    std::unordered_map<std::string, pxn::SenderLane*> lanes_by_rail_;
 };
 
 }  // namespace mooncake

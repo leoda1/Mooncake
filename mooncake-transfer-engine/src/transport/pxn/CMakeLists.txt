@@ -1,8 +1,8 @@
 add_library(pxn_transport OBJECT pxn_core.cpp)
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-  target_sources(pxn_transport PRIVATE pxn_registry.cpp pxn_sender.cpp
-                                pxn_staging.cpp)
+  target_sources(pxn_transport PRIVATE pxn_pump.cpp pxn_registry.cpp
+                                pxn_sender.cpp pxn_staging.cpp)
   target_link_libraries(pxn_transport PRIVATE glog::glog)
 
   if(USE_CUDA)

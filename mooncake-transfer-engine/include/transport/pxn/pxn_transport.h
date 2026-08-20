@@ -16,15 +16,18 @@
 #define MOONCAKE_TRANSFER_ENGINE_PXN_TRANSPORT_H_
 
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <condition_variable>
 #include <deque>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <span>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -357,11 +360,81 @@ class SenderPipeline {
     bool shutdown_ = false;
 };
 
+struct RelaySubmission {
+    uintptr_t source = 0;
+    std::string session;
+    std::vector<PlanEntry> plans;
+};
+
+class RelayTransfer {
+   public:
+    virtual ~RelayTransfer() = default;
+    virtual Status poll(bool& completed, int32_t& completion_status) = 0;
+    virtual void abandon() = 0;
+};
+
+class RelayBackend {
+   public:
+    virtual ~RelayBackend() = default;
+    virtual Status submit(const RelaySubmission& submission,
+                          std::unique_ptr<RelayTransfer>& transfer) = 0;
+};
+
+class RelayPipeline {
+   public:
+    RelayPipeline(ControlBlock* control, uintptr_t arena_address,
+                  uint64_t epoch, size_t max_inflight,
+                  std::unique_ptr<RelayBackend> backend);
+    ~RelayPipeline();
+
+    Status reapInbound(bool& made_progress);
+    Status progressInbound(bool& made_progress);
+    void shutdown();
+
+   private:
+    struct Inflight {
+        uint64_t sequence;
+        std::unique_ptr<RelayTransfer> transfer;
+    };
+
+    void complete(size_t lane_index, uint64_t sequence, int32_t status);
+
+    ControlBlock* control_;
+    uintptr_t arena_address_;
+    uint64_t epoch_;
+    size_t max_inflight_;
+    std::unique_ptr<RelayBackend> backend_;
+    std::array<uint64_t, kLaneCount> next_sequence_{};
+    std::array<std::deque<Inflight>, kLaneCount> inflight_;
+    size_t inflight_count_ = 0;
+    size_t next_lane_ = 0;
+};
+
+class PxnPump {
+   public:
+    PxnPump(SenderPipeline& sender, RelayPipeline& relay);
+    ~PxnPump();
+
+    void wake();
+    void shutdown();
+
+   private:
+    void run();
+
+    SenderPipeline& sender_;
+    RelayPipeline& relay_;
+    std::atomic<bool> running_{true};
+    std::mutex mutex_;
+    std::condition_variable condition_;
+    std::thread thread_;
+};
+
 std::unique_ptr<StagingBackend> makeCudaRdmaStagingBackend(
     RdmaTransport& transport, int device_id);
 std::unique_ptr<SenderBackend> makeCudaSenderBackend(int device_id);
 std::unique_ptr<SenderFallback> makeRdmaSenderFallback(
     RdmaTransport& transport);
+std::unique_ptr<RelayBackend> makeRdmaRelayBackend(RdmaTransport& transport);
 
 }  // namespace pxn
 }  // namespace mooncake

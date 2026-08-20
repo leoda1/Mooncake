@@ -20,6 +20,9 @@
 
 #include "config.h"
 #include "multi_transport_locality.h"
+#if defined(__linux__) && defined(USE_CUDA)
+#include "transport/pxn/pxn_rdma_transport.h"
+#endif
 #include "transport/rdma_transport/rdma_transport.h"
 #ifdef USE_BAREX
 #include "transport/barex_transport/barex_transport.h"
@@ -353,7 +356,15 @@ Transport* MultiTransport::installTransport(const std::string& proto,
 #endif
     Transport* transport = nullptr;
     if (std::string(proto) == "rdma") {
+#if defined(__linux__) && defined(USE_CUDA)
+        if (globalConfig().pxn_enable) {
+            transport = new PxnRdmaTransport();
+        } else {
+            transport = new RdmaTransport();
+        }
+#else
         transport = new RdmaTransport();
+#endif
     }
 #ifdef USE_UB
     else if (std::string(proto) == "ub") {
