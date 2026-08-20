@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "transport/pxn/pxn_staging.h"
+#include "transport/pxn/pxn_transport.h"
 
 #include <glog/logging.h>
 
@@ -42,7 +42,7 @@ Status StagingArena::initialize(StagingBackend& backend) {
     }
     if (address_ == 0) {
         auto cleanup = backend_->freeArena(address_);
-        if (!cleanup.ok()) quarantined_ = true;
+        if (!cleanup.ok()) quarantine_.trip();
         backend_ = nullptr;
         return cleanup.ok()
                    ? Status::Memory("PXN staging backend returned a null arena")
@@ -52,7 +52,7 @@ Status StagingArena::initialize(StagingBackend& backend) {
 
     status = backend_->registerArena(address_, kRequiredArenaSize);
     if (!status.ok()) {
-        quarantined_ = true;
+        quarantine_.trip();
         allocated_ = false;
         backend_ = nullptr;
         return status;
@@ -63,7 +63,7 @@ Status StagingArena::initialize(StagingBackend& backend) {
     if (!status.ok()) {
         auto cleanup = backend_->unregisterArena(address_);
         if (!cleanup.ok()) {
-            quarantined_ = true;
+            quarantine_.trip();
             ready_ = false;
             registered_ = false;
             allocated_ = false;
@@ -73,7 +73,7 @@ Status StagingArena::initialize(StagingBackend& backend) {
         registered_ = false;
         cleanup = backend_->freeArena(address_);
         allocated_ = false;
-        if (!cleanup.ok()) quarantined_ = true;
+        if (!cleanup.ok()) quarantine_.trip();
         if (cleanup.ok()) address_ = 0;
         backend_ = nullptr;
         return cleanup.ok() ? status : cleanup;
@@ -84,12 +84,12 @@ Status StagingArena::initialize(StagingBackend& backend) {
 }
 
 Status StagingArena::shutdown() {
-    if (backend_ == nullptr || quarantined_) return Status::OK();
+    if (backend_ == nullptr || quarantine_.quarantined()) return Status::OK();
     ready_ = false;
     if (registered_) {
         auto status = backend_->unregisterArena(address_);
         if (!status.ok()) {
-            quarantined_ = true;
+            quarantine_.trip();
             registered_ = false;
             allocated_ = false;
             backend_ = nullptr;
@@ -100,7 +100,7 @@ Status StagingArena::shutdown() {
     if (allocated_) {
         auto status = backend_->freeArena(address_);
         if (!status.ok()) {
-            quarantined_ = true;
+            quarantine_.trip();
             allocated_ = false;
             backend_ = nullptr;
             return status;
@@ -117,7 +117,7 @@ void StagingArena::abandon() {
     ready_ = false;
     allocated_ = false;
     registered_ = false;
-    quarantined_ = true;
+    quarantine_.trip();
     backend_ = nullptr;
 }
 
@@ -162,7 +162,7 @@ PeerResources::~PeerResources() {
 }
 
 Status PeerResources::shutdown() {
-    if (shutdown_ || quarantined_) return Status::OK();
+    if (shutdown_ || quarantine_.quarantined()) return Status::OK();
     if (imported_) {
         auto status = backend_->closeImportedArena(address_);
         if (!status.ok()) return status;
@@ -204,10 +204,9 @@ LaneControl* PeerResources::laneControl() const {
 }
 
 void PeerResources::quarantine() {
-    if (quarantined_) return;
+    if (!quarantine_.trip()) return;
     (void)mapping_.release();
     backend_ = nullptr;
-    quarantined_ = true;
 }
 
 LocalResources::LocalResources(std::unique_ptr<StagingBackend> backend,
@@ -297,7 +296,7 @@ Status LocalResources::shutdown() {
 Status LocalResources::mapPeer(const RegistryEntry& entry,
                                PeerResources*& peer) {
     peer = nullptr;
-    if (shutdown_ || quarantined_) {
+    if (shutdown_ || quarantine_.quarantined()) {
         return Status::InvalidArgument("PXN resources are not active");
     }
     for (const auto& existing : peers_) {
@@ -338,12 +337,11 @@ Status LocalResources::mapPeer(const RegistryEntry& entry,
 }
 
 void LocalResources::quarantine() {
-    if (quarantined_) return;
+    if (!quarantine_.trip()) return;
     arena_.abandon();
     (void)registration_.release();
     (void)registry_.release();
     (void)backend_.release();
-    quarantined_ = true;
 }
 
 }  // namespace pxn

@@ -23,6 +23,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <mutex>
+#include <optional>
 #include <random>
 #include <sstream>
 #include <string>
@@ -99,15 +100,26 @@ Status validateDirectory(int fd) {
     return Status::OK();
 }
 
-Status validateControlFile(int fd) {
+Status validateRegularFile(int fd, std::optional<off_t> expected_size,
+                           std::string_view error_message) {
     struct stat info{};
     if (fstat(fd, &info) != 0) return systemError("fstat failed", errno);
     if (!S_ISREG(info.st_mode) || info.st_uid != geteuid() ||
         (info.st_mode & 07777) != 0600 || info.st_nlink != 1 ||
-        info.st_size != static_cast<off_t>(sizeof(ControlBlock))) {
-        return Status::InvalidArgument("invalid PXN registry entry");
+        (expected_size.has_value() && info.st_size != *expected_size)) {
+        return Status::InvalidArgument(std::string(error_message));
     }
     return Status::OK();
+}
+
+Status validateControlFile(int fd) {
+    return validateRegularFile(
+        fd, static_cast<off_t>(sizeof(ControlBlock)),
+        "invalid PXN registry entry");
+}
+
+Status validateLockFile(int fd) {
+    return validateRegularFile(fd, std::nullopt, "invalid PXN registry lock");
 }
 
 Status validateRegistryHeader(const RegistryHeader& header) {
@@ -885,14 +897,12 @@ Status Registry::Open(RegistryOptions options,
         return systemError("open PXN registry lock failed", error);
     }
 
-    struct stat lock_info{};
-    if (fstat(lock_fd, &lock_info) != 0 || !S_ISREG(lock_info.st_mode) ||
-        lock_info.st_uid != geteuid() || (lock_info.st_mode & 07777) != 0600 ||
-        lock_info.st_nlink != 1) {
+    auto lock_status = validateLockFile(lock_fd);
+    if (!lock_status.ok()) {
         close(lock_fd);
         close(directory_fd);
         close(root_fd);
-        return Status::InvalidArgument("invalid PXN registry lock");
+        return lock_status;
     }
 
     ProcessProbe process_probe = std::move(options.process_probe);

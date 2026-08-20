@@ -24,7 +24,7 @@
 #include <string>
 #include <vector>
 
-#include "transport/pxn/pxn_staging.h"
+#include "transport/pxn/pxn_transport.h"
 
 namespace mooncake {
 namespace pxn {

@@ -22,7 +22,8 @@
 namespace mooncake {
 namespace pxn {
 class LocalResources;
-}
+class SenderPipeline;
+}  // namespace pxn
 
 class PxnRdmaTransport : public RdmaTransport {
    public:
@@ -32,9 +33,12 @@ class PxnRdmaTransport : public RdmaTransport {
                 std::shared_ptr<TransferMetadata> metadata,
                 std::shared_ptr<Topology> topology) override;
 
-    bool pxnReady() const { return resources_ != nullptr; }
+    bool pxnReady() const {
+        return resources_ != nullptr && sender_pipeline_ != nullptr;
+    }
 
    private:
+    std::unique_ptr<pxn::SenderPipeline> sender_pipeline_;
     std::unique_ptr<pxn::LocalResources> resources_;
 };
 

@@ -17,17 +17,21 @@
 #include <cuda_runtime.h>
 #include <glog/logging.h>
 
+#include <chrono>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "config.h"
-#include "transport/pxn/pxn_staging.h"
+#include "transport/pxn/pxn_transport.h"
 #include "transport/rdma_transport/rdma_context.h"
 
 namespace mooncake {
 
-PxnRdmaTransport::~PxnRdmaTransport() { resources_.reset(); }
+PxnRdmaTransport::~PxnRdmaTransport() {
+    sender_pipeline_.reset();
+    resources_.reset();
+}
 
 int PxnRdmaTransport::install(std::string& local_server_name,
                               std::shared_ptr<TransferMetadata> metadata,
@@ -59,7 +63,12 @@ int PxnRdmaTransport::install(std::string& local_server_name,
         std::move(backend), resources_);
     if (!status.ok()) {
         LOG(WARNING) << "PXN is disabled: " << status.ToString();
+        return result;
     }
+    sender_pipeline_ = std::make_unique<pxn::SenderPipeline>(
+        pxn::makeCudaSenderBackend(device_id),
+        pxn::makeRdmaSenderFallback(*this),
+        std::chrono::milliseconds(globalConfig().pxn_credit_timeout_ms));
     return result;
 }
 
