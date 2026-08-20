@@ -17,6 +17,7 @@
 #include <memory>
 
 #include "transport/pxn/pxn_transport.h"
+#include "transport/transport.h"
 
 namespace mooncake {
 namespace pxn {
@@ -81,6 +82,34 @@ TEST(PxnPumpTest, RelaysDoorbellAndPublishesCompletion) {
     EXPECT_TRUE(tryLoadCompletion(lane.completions[0], 1, completion_status));
     EXPECT_EQ(completion_status, 0);
     EXPECT_EQ(lane.header.completed, 1u);
+}
+
+TEST(PxnPumpTest, CompletesSliceWithoutTransferTask) {
+    struct Completion {
+        size_t completed = 0;
+        bool failed = false;
+    } completion;
+    auto callback = [](Transport::Slice* slice, bool success) {
+        auto* state = static_cast<Completion*>(slice->completion_context);
+        ++state->completed;
+        state->failed = state->failed || !success;
+    };
+
+    Transport::Slice slice{};
+    slice.length = 64;
+    slice.completion_callback = callback;
+    slice.completion_context = &completion;
+    slice.markSuccess();
+
+    Transport::Slice failed_slice{};
+    failed_slice.completion_callback = callback;
+    failed_slice.completion_context = &completion;
+    failed_slice.markFailed();
+
+    EXPECT_EQ(completion.completed, 2u);
+    EXPECT_TRUE(completion.failed);
+    EXPECT_EQ(slice.status, Transport::Slice::SUCCESS);
+    EXPECT_EQ(failed_slice.status, Transport::Slice::FAILED);
 }
 
 }  // namespace

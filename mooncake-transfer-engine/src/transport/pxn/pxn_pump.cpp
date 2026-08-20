@@ -14,9 +14,17 @@
 
 #include "transport/pxn/pxn_transport.h"
 
+#include <algorithm>
+#include <atomic>
+#include <memory>
+#include <string_view>
+#include <unordered_map>
 #include <utility>
 
+#include "common.h"
+#include "config.h"
 #include "error.h"
+#include "transport/rdma_transport/rdma_context.h"
 #include "transport/rdma_transport/rdma_transport.h"
 
 namespace mooncake {
@@ -39,35 +47,76 @@ class CompletedRelayTransfer final : public RelayTransfer {
     int32_t status_;
 };
 
+class RelaySlicePool {
+   public:
+    explicit RelaySlicePool(size_t capacity)
+        : storage_(std::make_unique<Transport::Slice[]>(capacity)) {
+        free_.reserve(capacity);
+        for (size_t index = 0; index < capacity; ++index) {
+            free_.push_back(&storage_[index]);
+        }
+    }
+
+    bool acquire(size_t count, std::vector<Transport::Slice*>& slices) {
+        if (count > free_.size()) return false;
+        slices.reserve(count);
+        for (size_t index = 0; index < count; ++index) {
+            slices.push_back(free_.back());
+            free_.pop_back();
+        }
+        return true;
+    }
+
+    void release(std::vector<Transport::Slice*>& slices) {
+        for (auto* slice : slices) {
+            slice->peer_nic_path.clear();
+            slice->source_location.clear();
+            slice->dest_rkeys.clear();
+            slice->cleanup_callback = nullptr;
+            slice->completion_callback = nullptr;
+            slice->completion_context = nullptr;
+            slice->task = nullptr;
+            free_.push_back(slice);
+        }
+        slices.clear();
+    }
+
+   private:
+    std::unique_ptr<Transport::Slice[]> storage_;
+    std::vector<Transport::Slice*> free_;
+};
+
 class RdmaRelayTransfer final : public RelayTransfer {
    public:
-    RdmaRelayTransfer(RdmaTransport& transport, Transport::BatchID batch_id,
-                      std::vector<Transport::TransferRequest> requests)
-        : transport_(transport),
-          batch_id_(batch_id),
-          requests_(std::move(requests)) {}
+    RdmaRelayTransfer(std::shared_ptr<RelaySlicePool> pool,
+                      std::vector<Transport::Slice*> slices)
+        : pool_(std::move(pool)),
+          slices_(std::move(slices)),
+          remaining_(slices_.size()) {}
 
-    std::vector<Transport::TransferRequest>& requests() { return requests_; }
+    ~RdmaRelayTransfer() override {
+        if (!submitted_ && !slices_.empty()) pool_->release(slices_);
+    }
+
+    std::vector<Transport::Slice*>& slices() { return slices_; }
+
+    void submitted() { submitted_ = true; }
+
+    static void completeSlice(Transport::Slice* slice, bool success) {
+        auto* transfer =
+            static_cast<RdmaRelayTransfer*>(slice->completion_context);
+        if (!success) transfer->failed_.store(true, std::memory_order_relaxed);
+        transfer->remaining_.fetch_sub(1, std::memory_order_release);
+    }
 
     Status poll(bool& completed, int32_t& completion_status) override {
         completed = false;
-        bool failed = false;
-        for (size_t index = 0; index < requests_.size(); ++index) {
-            Transport::TransferStatus status;
-            auto result = transport_.RdmaTransport::getTransferStatus(
-                batch_id_, index, status);
-            if (!result.ok()) return result;
-            if (status.s == Transport::WAITING ||
-                status.s == Transport::PENDING) {
-                return Status::OK();
-            }
-            failed = failed || status.s != Transport::COMPLETED;
+        if (remaining_.load(std::memory_order_acquire) != 0) {
+            return Status::OK();
         }
-
-        auto result = transport_.Transport::freeBatchID(batch_id_);
-        if (!result.ok()) return result;
-        batch_id_ = 0;
-        completion_status = failed ? ERR_CONTEXT : 0;
+        completion_status =
+            failed_.load(std::memory_order_relaxed) ? ERR_CONTEXT : 0;
+        pool_->release(slices_);
         completed = true;
         return Status::OK();
     }
@@ -75,60 +124,236 @@ class RdmaRelayTransfer final : public RelayTransfer {
     void abandon() override {}
 
    private:
-    RdmaTransport& transport_;
-    Transport::BatchID batch_id_;
-    std::vector<Transport::TransferRequest> requests_;
+    std::shared_ptr<RelaySlicePool> pool_;
+    std::vector<Transport::Slice*> slices_;
+    std::atomic<size_t> remaining_;
+    std::atomic<bool> failed_{false};
+    bool submitted_ = false;
 };
 
 class RdmaRelayBackend final : public RelayBackend {
    public:
-    explicit RdmaRelayBackend(RdmaTransport& transport)
-        : transport_(transport) {}
+    static Status Create(RdmaTransport& transport, uintptr_t arena_address,
+                         size_t max_inflight,
+                         std::unique_ptr<RelayBackend>& backend) {
+        auto candidate = std::unique_ptr<RdmaRelayBackend>(
+            new RdmaRelayBackend(transport, arena_address));
+        auto status = candidate->initialize(max_inflight);
+        if (!status.ok()) return status;
+        backend = std::move(candidate);
+        return Status::OK();
+    }
 
     Status submit(const RelaySubmission& submission,
                   std::unique_ptr<RelayTransfer>& transfer) override {
-        const auto target_id = transport_.getSegmentID(submission.session);
-        if (target_id == static_cast<Transport::SegmentID>(-1)) {
-            return Status::Metadata("PXN target session was not found");
-        }
+        size_t slice_count = 0;
+        auto status = forEachSlice(
+            submission, [&](uintptr_t, uint64_t, size_t, const TargetRoute&,
+                            Transport::SegmentID) { ++slice_count; });
+        if (!status.ok()) return status;
 
-        std::vector<Transport::TransferRequest> requests;
-        requests.reserve(submission.plans.size());
-        uintptr_t source = submission.source;
-        for (const auto& plan : submission.plans) {
-            Transport::TransferRequest request{};
-            request.opcode = Transport::TransferRequest::WRITE;
-            request.source = reinterpret_cast<void*>(source);
-            request.target_id = target_id;
-            request.target_offset = plan.final_destination;
-            request.length = static_cast<size_t>(plan.length);
-            requests.push_back(request);
-            source += plan.length;
+        std::vector<Transport::Slice*> slices;
+        if (!pool_->acquire(slice_count, slices)) {
+            return Status::BatchBusy("PXN relay slice pool is exhausted");
         }
+        auto candidate =
+            std::make_unique<RdmaRelayTransfer>(pool_, std::move(slices));
+        size_t slice_index = 0;
+        status = forEachSlice(
+            submission,
+            [&](uintptr_t source, uint64_t destination, size_t length,
+                const TargetRoute& route, Transport::SegmentID target_id) {
+                auto* slice = candidate->slices()[slice_index++];
+                slice->source_addr = reinterpret_cast<void*>(source);
+                slice->length = length;
+                slice->opcode = Transport::TransferRequest::WRITE;
+                slice->target_id = target_id;
+                slice->peer_nic_path = route.peer_nic_path;
+                slice->source_location.clear();
+                slice->status = Transport::Slice::PENDING;
+                slice->task = nullptr;
+                slice->dest_rkeys.clear();
+                slice->cleanup_callback = nullptr;
+                slice->completion_callback = &RdmaRelayTransfer::completeSlice;
+                slice->completion_context = candidate.get();
+                slice->rdma.dest_addr = destination;
+                slice->rdma.source_lkey = source_lkey_;
+                slice->rdma.dest_rkey = route.rkey;
+                slice->rdma.lkey_index = source_device_id_;
+                slice->rdma.rkey_index = route.device_id;
+                slice->rdma.qp_depth = nullptr;
+                slice->rdma.retry_cnt = 0;
+                slice->rdma.max_retry_cnt = globalConfig().retry_cnt;
+                slice->rdma.endpoint = nullptr;
+                slice->ts = 0;
+            });
+        if (!status.ok()) return status;
 
-        const auto batch_id =
-            transport_.Transport::allocateBatchID(requests.size());
-        auto candidate = std::make_unique<RdmaRelayTransfer>(
-            transport_, batch_id, std::move(requests));
-        auto& batch = Transport::toBatchDesc(batch_id);
-        batch.task_list.resize(candidate->requests().size());
-        std::vector<Transport::TransferTask*> tasks;
-        tasks.reserve(candidate->requests().size());
-        for (size_t index = 0; index < candidate->requests().size(); ++index) {
-            auto& task = batch.task_list[index];
-            task.batch_id = batch_id;
-            task.request = &candidate->requests()[index];
-            task.transport_ = &transport_;
-            tasks.push_back(&task);
+        const int result =
+            source_context_->submitPreparedPostSend(candidate->slices());
+        if (result != 0) {
+            return Status::Context("PXN relay RDMA submission failed");
         }
-
-        (void)transport_.RdmaTransport::submitTransferTask(tasks);
+        candidate->submitted();
         transfer = std::move(candidate);
         return Status::OK();
     }
 
    private:
+    using MrKey = Transport::Slice::mr_key_t;
+
+    struct TargetRoute {
+        uint64_t begin;
+        uint64_t end;
+        MrKey rkey;
+        int device_id;
+        std::string peer_nic_path;
+    };
+
+    struct SessionRoutes {
+        Transport::SegmentID target_id;
+        std::shared_ptr<RdmaTransport::SegmentDesc> descriptor;
+        std::vector<TargetRoute> routes;
+    };
+
+    RdmaRelayBackend(RdmaTransport& transport, uintptr_t arena_address)
+        : transport_(transport), arena_address_(arena_address) {}
+
+    Status initialize(size_t max_inflight) {
+        auto local = transport_.meta()->getSegmentDescByID(LOCAL_SEGMENT_ID);
+        int buffer_id = -1;
+        if (RdmaTransport::selectDevice(local.get(), arena_address_,
+                                        kRequiredArenaSize, buffer_id,
+                                        source_device_id_) != 0) {
+            return Status::AddressNotRegistered(
+                "PXN staging arena is not registered by one RDMA context");
+        }
+        const auto& contexts = transport_.getContextList();
+        if (source_device_id_ < 0 ||
+            static_cast<size_t>(source_device_id_) >= contexts.size() ||
+            contexts[source_device_id_] == nullptr ||
+            !contexts[source_device_id_]->active()) {
+            return Status::DeviceNotFound(
+                "PXN staging arena RDMA context is unavailable");
+        }
+        const auto& buffer = local->buffers[buffer_id];
+        if (static_cast<size_t>(source_device_id_) >= buffer.lkey.size()) {
+            return Status::AddressNotRegistered(
+                "PXN staging arena lkey is unavailable");
+        }
+        source_context_ = contexts[source_device_id_].get();
+        source_device_name_ = source_context_->deviceName();
+        source_lkey_ = buffer.lkey[source_device_id_];
+        slice_size_ = globalConfig().slice_size;
+        if (slice_size_ == 0) {
+            return Status::InvalidArgument("RDMA slice size must be nonzero");
+        }
+        const size_t slices_per_piece =
+            kMaxPlanCount + (kSlotSize + slice_size_ - 1) / slice_size_;
+        pool_ =
+            std::make_shared<RelaySlicePool>(max_inflight * slices_per_piece);
+        return Status::OK();
+    }
+
+    Status resolveRoute(std::string_view session, uint64_t destination,
+                        SessionRoutes*& session_routes,
+                        const TargetRoute*& route) {
+        auto it = sessions_.find(std::string(session));
+        if (it == sessions_.end()) {
+            const auto target_id =
+                transport_.getSegmentID(std::string(session));
+            if (target_id == static_cast<Transport::SegmentID>(-1)) {
+                return Status::Metadata("PXN target session was not found");
+            }
+            auto descriptor = transport_.meta()->getSegmentDescByID(target_id);
+            if (descriptor == nullptr) {
+                return Status::Metadata(
+                    "PXN target segment description was not found");
+            }
+            it = sessions_
+                     .emplace(
+                         std::string(session),
+                         SessionRoutes{target_id, std::move(descriptor), {}})
+                     .first;
+        }
+        session_routes = &it->second;
+        for (const auto& cached : session_routes->routes) {
+            if (destination >= cached.begin && destination < cached.end) {
+                route = &cached;
+                return Status::OK();
+            }
+        }
+
+        int buffer_id = -1;
+        int device_id = -1;
+        int result = 0;
+        if (globalConfig().enable_hca_peer_affinity) {
+            result = RdmaTransport::selectDeviceByLocalHca(
+                session_routes->descriptor.get(), destination, 1,
+                source_device_name_, buffer_id, device_id);
+        } else {
+            const auto hint = globalConfig().enable_dest_device_affinity
+                                  ? std::string_view(source_device_name_)
+                                  : std::string_view();
+            result = RdmaTransport::selectDevice(
+                session_routes->descriptor.get(), destination, 1, hint,
+                buffer_id, device_id);
+        }
+        if (result != 0) {
+            return Status::AddressNotRegistered(
+                "PXN target address is not registered");
+        }
+        const auto& descriptor = *session_routes->descriptor;
+        const auto& buffer = descriptor.buffers[buffer_id];
+        if (device_id < 0 ||
+            static_cast<size_t>(device_id) >= descriptor.devices.size() ||
+            static_cast<size_t>(device_id) >= buffer.rkey.size()) {
+            return Status::AddressNotRegistered(
+                "PXN target RDMA route is incomplete");
+        }
+        session_routes->routes.push_back(
+            {buffer.addr, buffer.addr + buffer.length, buffer.rkey[device_id],
+             device_id,
+             MakeNicPath(descriptor.nicPathServerName(),
+                         descriptor.devices[device_id].name)});
+        route = &session_routes->routes.back();
+        return Status::OK();
+    }
+
+    template <typename Callback>
+    Status forEachSlice(const RelaySubmission& submission,
+                        Callback&& callback) {
+        uintptr_t source = submission.source;
+        for (const auto& plan : submission.plans) {
+            uint64_t destination = plan.final_destination;
+            uint64_t remaining = plan.length;
+            while (remaining != 0) {
+                SessionRoutes* session_routes = nullptr;
+                const TargetRoute* route = nullptr;
+                auto status = resolveRoute(submission.session, destination,
+                                           session_routes, route);
+                if (!status.ok()) return status;
+                const size_t length = static_cast<size_t>(std::min<uint64_t>(
+                    {remaining, slice_size_, route->end - destination}));
+                callback(source, destination, length, *route,
+                         session_routes->target_id);
+                source += length;
+                destination += length;
+                remaining -= length;
+            }
+        }
+        return Status::OK();
+    }
+
     RdmaTransport& transport_;
+    uintptr_t arena_address_;
+    RdmaContext* source_context_ = nullptr;
+    std::string source_device_name_;
+    MrKey source_lkey_ = 0;
+    int source_device_id_ = -1;
+    size_t slice_size_ = 0;
+    std::shared_ptr<RelaySlicePool> pool_;
+    std::unordered_map<std::string, SessionRoutes> sessions_;
 };
 
 }  // namespace
@@ -281,8 +506,11 @@ void PxnPump::run() {
     }
 }
 
-std::unique_ptr<RelayBackend> makeRdmaRelayBackend(RdmaTransport& transport) {
-    return std::make_unique<RdmaRelayBackend>(transport);
+Status makeRdmaRelayBackend(RdmaTransport& transport, uintptr_t arena_address,
+                            size_t max_inflight,
+                            std::unique_ptr<RelayBackend>& backend) {
+    return RdmaRelayBackend::Create(transport, arena_address, max_inflight,
+                                    backend);
 }
 
 }  // namespace pxn

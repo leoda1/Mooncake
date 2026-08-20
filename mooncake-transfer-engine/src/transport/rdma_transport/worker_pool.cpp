@@ -312,9 +312,7 @@ void WorkerPool::enqueuePreparedSlices(SliceList (&slice_list_map)[kShardCount],
 
 int WorkerPool::submitPreparedPostSend(
     const std::vector<Transport::Slice *> &slice_list) {
-    // Called by a different local RNIC's worker during local failover. The
-    // slice already carries the chosen peer_nic_path and refreshed local lkey,
-    // so enqueue it directly instead of running remote-path selection again.
+    // The slices already carry peer paths and memory keys.
     SliceList slice_list_map[kShardCount];
     uint64_t submitted_slice_count = 0;
 

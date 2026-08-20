@@ -33,6 +33,8 @@ class WorkerPool {
 
     // Add slices to queue, called by Transport
     int submitPostSend(const std::vector<Transport::Slice *> &slice_list);
+    int submitPreparedPostSend(
+        const std::vector<Transport::Slice *> &slice_list);
 
     void trackPostedSlices(const std::vector<Transport::Slice *> &slice_list,
                            size_t first, size_t count);
@@ -43,12 +45,6 @@ class WorkerPool {
     using SliceList = std::vector<Transport::Slice *>;
     const static int kShardCount = 8;
 
-    // Enqueue slices that were prepared by another WorkerPool. Used for
-    // local-NIC failure handoff: the original worker keeps the remote path
-    // fixed, updates the local lkey, and pushes the slice to this context's
-    // worker queue.
-    int submitPreparedPostSend(
-        const std::vector<Transport::Slice *> &slice_list);
     void enqueuePreparedSlices(SliceList (&slice_list_map)[kShardCount],
                                uint64_t submitted_slice_count);
 

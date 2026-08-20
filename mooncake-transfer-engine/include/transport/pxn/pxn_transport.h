@@ -434,7 +434,9 @@ std::unique_ptr<StagingBackend> makeCudaRdmaStagingBackend(
 std::unique_ptr<SenderBackend> makeCudaSenderBackend(int device_id);
 std::unique_ptr<SenderFallback> makeRdmaSenderFallback(
     RdmaTransport& transport);
-std::unique_ptr<RelayBackend> makeRdmaRelayBackend(RdmaTransport& transport);
+Status makeRdmaRelayBackend(RdmaTransport& transport, uintptr_t arena_address,
+                            size_t max_inflight,
+                            std::unique_ptr<RelayBackend>& backend);
 
 }  // namespace pxn
 }  // namespace mooncake

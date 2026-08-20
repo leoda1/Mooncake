@@ -141,6 +141,9 @@ class Transport {
         // delete the slice.
         using CleanupCallback = void (*)(Slice *);
         CleanupCallback cleanup_callback = nullptr;
+        using CompletionCallback = void (*)(Slice *, bool);
+        CompletionCallback completion_callback = nullptr;
+        void *completion_context = nullptr;
 
         union {
             struct {
@@ -201,6 +204,10 @@ class Transport {
        public:
         void markSuccess() {
             status = Slice::SUCCESS;
+            if (completion_callback != nullptr) {
+                completion_callback(this, true);
+                return;
+            }
             __atomic_fetch_add(&task->transferred_bytes, length,
                                __ATOMIC_RELAXED);
             __atomic_fetch_add(&task->success_slice_count, 1, __ATOMIC_RELAXED);
@@ -210,6 +217,10 @@ class Transport {
 
         void markFailed() {
             status = Slice::FAILED;
+            if (completion_callback != nullptr) {
+                completion_callback(this, false);
+                return;
+            }
             __atomic_fetch_add(&task->failed_slice_count, 1, __ATOMIC_RELAXED);
 
             check_batch_completion(true);
@@ -306,6 +317,8 @@ class Transport {
             auto cleanup = slice->cleanup_callback;
             slice->cleanup_callback = nullptr;
             if (cleanup) cleanup(slice);
+            slice->completion_callback = nullptr;
+            slice->completion_context = nullptr;
 
             if (head_ - tail_ == kLazyDeleteSliceCapacity) {
                 delete slice;
