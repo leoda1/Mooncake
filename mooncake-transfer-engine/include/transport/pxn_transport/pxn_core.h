@@ -26,7 +26,7 @@
 #include <vector>
 
 #include "common/base/status.h"
-#include "transport/pxn/pxn_constants.h"
+#include "transport/pxn_transport/pxn_constants.h"
 
 namespace mooncake {
 namespace pxn {

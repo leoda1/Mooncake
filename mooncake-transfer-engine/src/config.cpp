@@ -32,7 +32,8 @@
 #include <json/json.h>
 #endif
 
-#include "transport/pxn/pxn_core.h"
+#include "transport/pxn_transport/pxn_core.h"
+#include "transport/pxn_transport/pxn_registry.h"
 
 namespace mooncake {
 namespace {

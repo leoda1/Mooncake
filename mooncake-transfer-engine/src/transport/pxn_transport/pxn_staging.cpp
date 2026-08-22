@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "transport/pxn/pxn_transport.h"
+#include "transport/pxn_transport/pxn_transport.h"
 
 #include <glog/logging.h>
 

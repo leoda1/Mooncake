@@ -21,7 +21,7 @@
 #include "config.h"
 #include "multi_transport_locality.h"
 #if defined(__linux__) && defined(USE_CUDA)
-#include "transport/pxn/pxn_rdma_transport.h"
+#include "transport/pxn_transport/pxn_rdma_transport.h"
 #endif
 #include "transport/rdma_transport/rdma_transport.h"
 #ifdef USE_BAREX

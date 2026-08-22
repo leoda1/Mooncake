@@ -16,7 +16,7 @@
 
 #include <memory>
 
-#include "transport/pxn/pxn_transport.h"
+#include "transport/pxn_transport/pxn_transport.h"
 #include "transport/transport.h"
 
 namespace mooncake {

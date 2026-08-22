@@ -32,8 +32,8 @@
 #include <vector>
 
 #include "common/base/status.h"
-#include "transport/pxn/pxn_core.h"
-#include "transport/pxn/pxn_registry.h"
+#include "transport/pxn_transport/pxn_core.h"
+#include "transport/pxn_transport/pxn_registry.h"
 
 namespace mooncake {
 class RdmaTransport;

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "transport/pxn/pxn_rdma_transport.h"
+#include "transport/pxn_transport/pxn_rdma_transport.h"
 
 #include <cuda_runtime.h>
 #include <glog/logging.h>
@@ -23,7 +23,7 @@
 #include <vector>
 
 #include "config.h"
-#include "transport/pxn/pxn_transport.h"
+#include "transport/pxn_transport/pxn_transport.h"
 #include "transport/rdma_transport/rdma_context.h"
 
 namespace mooncake {

@@ -21,7 +21,7 @@
 #include <thread>
 #include <vector>
 
-#include "transport/pxn/pxn_transport.h"
+#include "transport/pxn_transport/pxn_transport.h"
 
 namespace mooncake {
 namespace pxn {

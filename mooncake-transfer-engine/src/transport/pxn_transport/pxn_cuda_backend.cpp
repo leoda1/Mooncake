@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "transport/pxn/pxn_transport.h"
+#include "transport/pxn_transport/pxn_transport.h"
 
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -31,6 +31,13 @@ namespace pxn {
 namespace {
 
 static_assert(sizeof(cudaIpcMemHandle_t) == kCudaIpcHandleSize);
+#if CUDA_VERSION >= 11070
+constexpr CUdevice_attribute kCanUseStreamMemOpsAttribute =
+    CU_DEVICE_ATTRIBUTE_CAN_USE_STREAM_MEM_OPS_V1;
+#else
+constexpr CUdevice_attribute kCanUseStreamMemOpsAttribute =
+    CU_DEVICE_ATTRIBUTE_CAN_USE_STREAM_MEM_OPS;
+#endif
 
 Status cudaError(std::string_view operation, cudaError_t error) {
     return Status::Memory(std::string(operation) + ": " +
@@ -264,7 +271,7 @@ class CudaSenderBackend final : public SenderBackend {
         CUdevice cuda_device;
         if (cuDeviceGet(&cuda_device, device_id_) == CUDA_SUCCESS &&
             cuDeviceGetAttribute(&stream_mem_ops,
-                                 CU_DEVICE_ATTRIBUTE_CAN_USE_STREAM_MEM_OPS,
+                                 kCanUseStreamMemOpsAttribute,
                                  cuda_device) == CUDA_SUCCESS &&
             stream_mem_ops != 0) {
             candidate->stream_mem_ops_ = true;
