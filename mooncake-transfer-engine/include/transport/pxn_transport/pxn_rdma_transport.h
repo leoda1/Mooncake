@@ -32,7 +32,11 @@ class SenderPipeline;
 
 class PxnRdmaTransport : public RdmaTransport {
    public:
+    PxnRdmaTransport();
     ~PxnRdmaTransport() override;
+
+    PxnRdmaTransport(const PxnRdmaTransport&) = delete;
+    PxnRdmaTransport& operator=(const PxnRdmaTransport&) = delete;
 
     int install(std::string& local_server_name,
                 std::shared_ptr<TransferMetadata> metadata,

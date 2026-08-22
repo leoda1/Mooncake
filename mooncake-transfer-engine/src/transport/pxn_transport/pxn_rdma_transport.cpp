@@ -49,6 +49,8 @@ bool covers(const TransferMetadata::BufferDesc& buffer, uint64_t address,
 
 }  // namespace
 
+PxnRdmaTransport::PxnRdmaTransport() = default;
+
 PxnRdmaTransport::~PxnRdmaTransport() {
     pump_.reset();
     relay_pipeline_.reset();
