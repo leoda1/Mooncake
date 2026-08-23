@@ -411,6 +411,16 @@ Status RelayPipeline::progressInbound(bool& made_progress) {
             continue;
         }
 
+        const uint64_t sender_epoch =
+            __atomic_load_n(&lane.header.sender_epoch, __ATOMIC_ACQUIRE);
+        if (lane_sender_epoch_[lane_index] != sender_epoch) {
+            if (!inflight_[lane_index].empty()) {
+                continue;
+            }
+            lane_sender_epoch_[lane_index] = sender_epoch;
+            next_sequence_[lane_index] = 1;
+        }
+
         const uint64_t sequence = next_sequence_[lane_index];
         const uint64_t doorbell =
             __atomic_load_n(&lane.header.doorbell, __ATOMIC_ACQUIRE);

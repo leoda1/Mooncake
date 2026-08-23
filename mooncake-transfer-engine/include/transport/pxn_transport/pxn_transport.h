@@ -417,6 +417,7 @@ class RelayPipeline {
     size_t max_inflight_;
     std::unique_ptr<RelayBackend> backend_;
     std::array<uint64_t, kLaneCount> next_sequence_{};
+    std::array<uint64_t, kLaneCount> lane_sender_epoch_{};
     std::array<std::deque<Inflight>, kLaneCount> inflight_;
     std::atomic<uint64_t> relayed_bytes_{0};
     size_t inflight_count_ = 0;
