@@ -104,6 +104,11 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   target_link_libraries(pxn_pump_test PUBLIC transfer_engine gtest gtest_main)
   add_test(NAME pxn_pump_test COMMAND pxn_pump_test)
   set_tests_properties(pxn_pump_test PROPERTIES LABELS "pxn" TIMEOUT 30)
+
+  add_executable(pxn_e2e_test ${WORKSPACE}/pxn_e2e_test.cpp)
+  target_link_libraries(pxn_e2e_test PUBLIC transfer_engine gtest gtest_main)
+  add_test(NAME pxn_e2e_test COMMAND pxn_e2e_test)
+  set_tests_properties(pxn_e2e_test PROPERTIES LABELS "pxn" TIMEOUT 600)
 endif()
 
 # This test verifies endpoint re-establishment in RDMATransport.

@@ -280,6 +280,9 @@ class SenderLane {
     uint64_t reapedSequence() const { return reaped_sequence_; }
     size_t inflightCount() const { return inflight_.size(); }
     bool quarantined() const { return quarantine_.quarantined(); }
+    uint64_t fallbackBytes() const {
+        return fallback_bytes_.load(std::memory_order_relaxed);
+    }
 
    private:
     struct QueuedSubmission {
@@ -324,6 +327,7 @@ class SenderLane {
     uint64_t next_sequence_ = 1;
     uint64_t reaped_sequence_ = 0;
     std::atomic<bool> accepting_{true};
+    std::atomic<uint64_t> fallback_bytes_{0};
     AtomicQuarantineLatch quarantine_;
     bool shutdown_ = false;
 };
@@ -342,6 +346,9 @@ class SenderPipeline {
     Status reapOutbound(bool& made_progress);
     Status progressOutbound(bool& made_progress);
     Status shutdown();
+
+    // Sum of every lane's fallback byte counter.
+    uint64_t fallbackBytes();
 
    private:
     struct PeerLaneEntry {
@@ -391,6 +398,11 @@ class RelayPipeline {
     Status progressInbound(bool& made_progress);
     void shutdown();
 
+    // Bytes successfully forwarded by the relay's second hop.
+    uint64_t relayedBytes() const {
+        return relayed_bytes_.load(std::memory_order_relaxed);
+    }
+
    private:
     struct Inflight {
         uint64_t sequence;
@@ -406,6 +418,7 @@ class RelayPipeline {
     std::unique_ptr<RelayBackend> backend_;
     std::array<uint64_t, kLaneCount> next_sequence_{};
     std::array<std::deque<Inflight>, kLaneCount> inflight_;
+    std::atomic<uint64_t> relayed_bytes_{0};
     size_t inflight_count_ = 0;
     size_t next_lane_ = 0;
 };

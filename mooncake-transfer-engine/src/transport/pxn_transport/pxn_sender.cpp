@@ -292,6 +292,8 @@ Status SenderLane::startFallback(QueuedSubmission queued) {
         failSubmission(queued.submission);
         return status;
     }
+    fallback_bytes_.fetch_add(queued.submission.piece.length,
+                              std::memory_order_relaxed);
     if (transfer != nullptr) {
         fallback_transfers_.push_back(std::move(transfer));
     }
@@ -498,6 +500,13 @@ Status SenderPipeline::progressOutbound(bool& made_progress) {
         next_lane_ = (next_lane_ + 1) % lanes_.size();
     }
     return lane->progress(made_progress);
+}
+
+uint64_t SenderPipeline::fallbackBytes() {
+    std::lock_guard<std::mutex> lock(lanes_mutex_);
+    uint64_t total = 0;
+    for (const auto& lane : lanes_) total += lane->fallbackBytes();
+    return total;
 }
 
 Status SenderPipeline::shutdown() {

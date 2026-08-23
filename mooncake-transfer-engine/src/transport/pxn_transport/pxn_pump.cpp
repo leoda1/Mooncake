@@ -469,6 +469,10 @@ void RelayPipeline::complete(size_t lane_index, uint64_t sequence,
                              int32_t status) {
     auto& lane = control_->lanes[lane_index];
     const size_t slot = *slotIndex(sequence);
+    if (status == 0) {
+        relayed_bytes_.fetch_add(lane.descriptors[slot].piece_length,
+                                 std::memory_order_relaxed);
+    }
     (void)commitCompletion(lane.completions[slot], sequence, status);
     __atomic_store_n(&lane.header.completed, sequence, __ATOMIC_RELEASE);
 }
