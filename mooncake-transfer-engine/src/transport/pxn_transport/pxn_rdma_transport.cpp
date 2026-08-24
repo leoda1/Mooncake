@@ -61,6 +61,7 @@ PxnRdmaTransport::~PxnRdmaTransport() {
 int PxnRdmaTransport::install(std::string& local_server_name,
                               std::shared_ptr<TransferMetadata> metadata,
                               std::shared_ptr<Topology> topology) {
+    auto pxn_topology = topology;
     const int result = RdmaTransport::install(
         local_server_name, std::move(metadata), std::move(topology));
     if (result != 0 || !globalConfig().pxn_enable) return result;
@@ -80,6 +81,26 @@ int PxnRdmaTransport::install(std::string& local_server_name,
         return result;
     }
 
+    if (active_hcas.size() > 1 && pxn_topology != nullptr) {
+        const std::string location = "cuda:" + std::to_string(device_id);
+        const int preferred = pxn_topology->selectDevice(location);
+        if (preferred >= 0 &&
+            static_cast<size_t>(preferred) < getContextList().size()) {
+            const auto& context = getContextList()[preferred];
+            if (context != nullptr && context->active()) {
+                LOG(INFO) << "PXN local rail for " << location << " is "
+                          << context->deviceName() << " (of "
+                          << active_hcas.size() << " active HCAs)";
+                active_hcas = {context->deviceName()};
+            }
+        }
+        if (active_hcas.size() > 1) {
+            LOG(WARNING) << "PXN is disabled: cannot pick a local rail for "
+                         << location << " among " << active_hcas.size()
+                         << " active HCAs";
+            return result;
+        }
+    }
     pxn::RegistryOptions registry_options;
     registry_options.group_id = globalConfig().pxn_group_id;
     auto backend = pxn::makeCudaRdmaStagingBackend(*this, device_id);
@@ -196,6 +217,17 @@ Status PxnRdmaTransport::submitTransferTask(
         }
     }
 
+    for (const auto* task : direct_tasks) {
+        pxn_stats_.direct_bytes.fetch_add(task->request->length,
+                                          std::memory_order_relaxed);
+    }
+    for (const auto& item : pending) {
+        pxn_stats_.pxn_used.fetch_add(1, std::memory_order_relaxed);
+        pxn_stats_.pxn_bytes.fetch_add(item.submission.piece.length,
+                                       std::memory_order_relaxed);
+    }
+    reportPxnStats();
+
     Status result;
     if (!direct_tasks.empty()) {
         result = RdmaTransport::submitTransferTask(direct_tasks);
@@ -212,6 +244,7 @@ bool PxnRdmaTransport::selectPxnLane(const TransferRequest& request,
                                      std::string& session,
                                      pxn::SenderLane*& lane) {
     if (request.opcode != TransferRequest::WRITE || request.length == 0) {
+        pxn_stats_.not_write.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
 
@@ -225,11 +258,15 @@ bool PxnRdmaTransport::selectPxnLane(const TransferRequest& request,
             break;
         }
     }
-    if (!cuda_source) return false;
+    if (!cuda_source) {
+        pxn_stats_.not_cuda.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
 
     auto target = metadata_->getSegmentDescByID(request.target_id);
     if (target == nullptr || target->name.empty() ||
         target->name.size() > pxn::kMaxSessionLength) {
+        pxn_stats_.no_target.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
 
@@ -238,12 +275,20 @@ bool PxnRdmaTransport::selectPxnLane(const TransferRequest& request,
     if (RdmaTransport::selectDevice(target.get(), request.target_offset,
                                     request.length, buffer_id,
                                     device_id) != 0) {
+        pxn_stats_.no_device.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
     pxn::RailResolver resolver(globalConfig().pxn_rail_map);
     const std::string target_rail =
         resolver.canonicalize(target->devices[device_id].name);
-    if (target_rail == resources_->localRail()) return false;
+    if (target_rail == resources_->localRail()) {
+        if (pxn_stats_.same_rail.fetch_add(1, std::memory_order_relaxed) == 0) {
+            LOG(WARNING) << "PXN skipped: target rail " << target_rail
+                         << " == local rail " << resources_->localRail()
+                         << " (same rail always uses native RDMA)";
+        }
+        return false;
+    }
 
     std::lock_guard<std::mutex> lock(peer_mutex_);
     auto cached = lanes_by_rail_.find(target_rail);
@@ -253,7 +298,10 @@ bool PxnRdmaTransport::selectPxnLane(const TransferRequest& request,
         return true;
     }
     std::vector<pxn::RegistryEntry> entries;
-    if (!resources_->registry().discover(entries).ok()) return false;
+    if (!resources_->registry().discover(entries).ok()) {
+        pxn_stats_.no_relay.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
     for (const auto& entry : entries) {
         if (entry.rail != target_rail) continue;
         pxn::PeerResources* peer = nullptr;
@@ -263,7 +311,28 @@ bool PxnRdmaTransport::selectPxnLane(const TransferRequest& request,
         session = target->name;
         return true;
     }
+    if (pxn_stats_.no_relay.fetch_add(1, std::memory_order_relaxed) == 0) {
+        std::string rails;
+        for (const auto& e : entries) rails += e.rail + " ";
+        LOG(WARNING) << "PXN skipped: no relay on rail " << target_rail
+                     << "; registry has [" << rails << "] -- a same-machine "
+                     << "process must own a NIC on the target rail";
+    }
     return false;
+}
+
+void PxnRdmaTransport::reportPxnStats() {
+    const uint64_t n = pxn_stats_.reported.fetch_add(1) + 1;
+    if (n % 200 != 0) return;
+    LOG(INFO) << "PXN stats: used=" << pxn_stats_.pxn_used.load()
+              << " pxn_bytes=" << pxn_stats_.pxn_bytes.load()
+              << " direct_bytes=" << pxn_stats_.direct_bytes.load()
+              << " | skipped: same_rail=" << pxn_stats_.same_rail.load()
+              << " no_relay=" << pxn_stats_.no_relay.load()
+              << " not_cuda=" << pxn_stats_.not_cuda.load()
+              << " no_device=" << pxn_stats_.no_device.load()
+              << " no_target=" << pxn_stats_.no_target.load()
+              << " not_write=" << pxn_stats_.not_write.load();
 }
 
 }  // namespace mooncake
