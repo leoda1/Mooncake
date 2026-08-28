@@ -26,6 +26,7 @@ namespace mooncake {
 namespace pxn {
 class LocalResources;
 class PxnPump;
+class RailResolver;
 class RelayPipeline;
 class SenderLane;
 class SenderPipeline;
@@ -51,26 +52,32 @@ class PxnRdmaTransport : public RdmaTransport {
     }
 
    private:
-    bool selectPxnLane(const TransferRequest& request, std::string& session,
+    struct SelectionContext;
+
+    bool selectPxnLane(const TransferRequest& request,
+                       SelectionContext& context, std::string& session,
                        pxn::SenderLane*& lane);
 
     std::unique_ptr<pxn::PxnPump> pump_;
     std::unique_ptr<pxn::RelayPipeline> relay_pipeline_;
     std::unique_ptr<pxn::SenderPipeline> sender_pipeline_;
     std::unique_ptr<pxn::LocalResources> resources_;
+    std::unique_ptr<pxn::RailResolver> rail_resolver_;
     std::mutex peer_mutex_;
     std::unordered_map<std::string, pxn::SenderLane*> lanes_by_rail_;
 
     struct PxnStats {
-        std::atomic<uint64_t> not_write{0};      // opcode != WRITE or len 0
-        std::atomic<uint64_t> not_cuda{0};       // source is host memory
-        std::atomic<uint64_t> no_target{0};      // target segment unusable
-        std::atomic<uint64_t> no_device{0};      // selectDevice failed
-        std::atomic<uint64_t> same_rail{0};      // same rail -> native RDMA
-        std::atomic<uint64_t> no_relay{0};       // cross rail but no relay
-        std::atomic<uint64_t> pxn_used{0};       // took the PXN path
+        std::atomic<uint64_t> not_write{0};  // opcode != WRITE or len 0
+        std::atomic<uint64_t> not_cuda{0};   // source is host memory
+        std::atomic<uint64_t> no_target{0};  // target segment unusable
+        std::atomic<uint64_t> no_device{0};  // selectDevice failed
+        std::atomic<uint64_t> same_rail{0};  // same rail -> native RDMA
+        std::atomic<uint64_t> no_relay{0};   // cross rail but no relay
+        std::atomic<uint64_t> pxn_used{0};   // took the PXN path
         std::atomic<uint64_t> pxn_bytes{0};
         std::atomic<uint64_t> direct_bytes{0};
+        std::atomic<uint64_t> route_cache_hit{0};
+        std::atomic<uint64_t> route_cache_miss{0};
         std::atomic<uint64_t> reported{0};
     };
     PxnStats pxn_stats_;
