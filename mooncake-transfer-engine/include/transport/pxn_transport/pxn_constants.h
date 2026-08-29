@@ -27,6 +27,7 @@ inline constexpr size_t kRequiredArenaSize =
     kLaneCount * kSlotsPerLane * kSlotSize;
 inline constexpr size_t kMaxPlanCount = 4096;
 inline constexpr size_t kMaxSessionLength = 256;
+inline constexpr size_t kMaxRailsPerRank = 16;
 
 static_assert(kRequiredArenaSize == 1008ULL * 1024 * 1024);
 

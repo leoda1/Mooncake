@@ -21,6 +21,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -33,7 +34,7 @@ namespace mooncake {
 namespace pxn {
 
 inline constexpr uint64_t kRegistryMagic = 0x4D4350584E524547ULL;
-inline constexpr uint32_t kRegistryAbiVersion = 1;
+inline constexpr uint32_t kRegistryAbiVersion = 2;
 inline constexpr size_t kMaxRailNameLength = 256;
 inline constexpr size_t kCudaIpcHandleSize = 64;
 
@@ -78,7 +79,7 @@ struct alignas(64) RegistryHeader {
     uint64_t slot_size;
     uint64_t arena_size;
     uint32_t ipc_handle_bytes;
-    uint32_t reserved;
+    uint32_t rail_count;
     char rail[kMaxRailNameLength];
     CudaIpcHandle arena_handle;
     uint8_t padding[32];
@@ -145,7 +146,7 @@ struct RegistryOptions {
 struct RegistryEntry {
     ProcessIdentity identity;
     uint64_t epoch;
-    std::string rail;
+    std::vector<std::string> rails;
     CudaIpcHandle arena_handle;
     std::string file_name;
 };
@@ -226,7 +227,8 @@ class Registry {
     static Status Open(RegistryOptions options,
                        std::unique_ptr<Registry>& registry);
 
-    Status createLocal(std::string_view rail, const CudaIpcHandle& arena_handle,
+    Status createLocal(std::span<const std::string> rails,
+                       const CudaIpcHandle& arena_handle,
                        std::unique_ptr<RegistryRegistration>& registration);
     Status discover(std::vector<RegistryEntry>& entries);
     Status mapPeer(const RegistryEntry& entry,

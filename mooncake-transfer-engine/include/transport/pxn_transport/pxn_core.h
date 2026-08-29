@@ -42,7 +42,7 @@ struct alignas(64) Descriptor {
     uint32_t piece_length;
     uint32_t plan_count;
     uint32_t session_length;
-    uint32_t reserved;
+    uint32_t rail_index;
     char session[kMaxSessionLength];
     PlanEntry plans[kMaxPlanCount];
 };
@@ -64,7 +64,7 @@ static_assert(offsetof(Descriptor, epoch) == 8);
 static_assert(offsetof(Descriptor, piece_length) == 16);
 static_assert(offsetof(Descriptor, plan_count) == 20);
 static_assert(offsetof(Descriptor, session_length) == 24);
-static_assert(offsetof(Descriptor, reserved) == 28);
+static_assert(offsetof(Descriptor, rail_index) == 28);
 static_assert(offsetof(Descriptor, session) == 32);
 static_assert(offsetof(Descriptor, plans) == 288);
 static_assert(sizeof(Descriptor) == 65856);
@@ -86,7 +86,7 @@ enum class DescriptorError {
     kPieceLength,
     kPlanCount,
     kSessionLength,
-    kReserved,
+    kRailIndex,
     kPlanLength,
     kDestinationOverflow,
     kLengthMismatch,
@@ -132,7 +132,12 @@ Status buildPieces(std::span<const TransferSpan> spans,
                    std::vector<Piece>& pieces);
 
 Status prepareDescriptor(const Piece& piece, std::string_view session,
-                         uint64_t epoch, Descriptor& descriptor);
+                         uint64_t epoch, uint32_t rail_index,
+                         Descriptor& descriptor);
+inline Status prepareDescriptor(const Piece& piece, std::string_view session,
+                                uint64_t epoch, Descriptor& descriptor) {
+    return prepareDescriptor(piece, session, epoch, 0, descriptor);
+}
 
 bool commitDescriptor(Descriptor& descriptor, uint64_t sequence);
 uint64_t loadDescriptorSequence(const Descriptor& descriptor);

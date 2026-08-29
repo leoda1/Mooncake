@@ -134,11 +134,14 @@ class RdmaRelayTransfer final : public RelayTransfer {
 class RdmaRelayBackend final : public RelayBackend {
    public:
     static Status Create(RdmaTransport& transport, uintptr_t arena_address,
+                         std::span<const std::string> source_device_names,
+                         std::span<const std::string> source_rails,
                          size_t max_inflight,
                          std::unique_ptr<RelayBackend>& backend) {
         auto candidate = std::unique_ptr<RdmaRelayBackend>(
             new RdmaRelayBackend(transport, arena_address));
-        auto status = candidate->initialize(max_inflight);
+        auto status = candidate->initialize(source_device_names, source_rails,
+                                            max_inflight);
         if (!status.ok()) return status;
         backend = std::move(candidate);
         return Status::OK();
@@ -146,6 +149,12 @@ class RdmaRelayBackend final : public RelayBackend {
 
     Status submit(const RelaySubmission& submission,
                   std::unique_ptr<RelayTransfer>& transfer) override {
+        if (submission.rail_index >= source_rails_.size()) {
+            return Status::InvalidArgument("PXN relay rail index is invalid");
+        }
+        const auto& source_rail = source_rails_[submission.rail_index];
+        VLOG(1) << "PXN relay uses rail[" << submission.rail_index << "] "
+                << source_rail.device_name << " for " << submission.session;
         size_t slice_count = 0;
         auto status = forEachSlice(
             submission, [&](uintptr_t, uint64_t, size_t, const TargetRoute&,
@@ -177,9 +186,9 @@ class RdmaRelayBackend final : public RelayBackend {
                 slice->completion_callback = &RdmaRelayTransfer::completeSlice;
                 slice->completion_context = candidate.get();
                 slice->rdma.dest_addr = destination;
-                slice->rdma.source_lkey = source_lkey_;
+                slice->rdma.source_lkey = source_rail.lkey;
                 slice->rdma.dest_rkey = route.rkey;
-                slice->rdma.lkey_index = source_device_id_;
+                slice->rdma.lkey_index = source_rail.device_id;
                 slice->rdma.rkey_index = route.device_id;
                 slice->rdma.qp_depth = nullptr;
                 slice->rdma.retry_cnt = 0;
@@ -190,7 +199,7 @@ class RdmaRelayBackend final : public RelayBackend {
         if (!status.ok()) return status;
 
         const int result =
-            source_context_->submitPreparedPostSend(candidate->slices());
+            source_rail.context->submitPreparedPostSend(candidate->slices());
         if (result != 0) {
             return Status::Context("PXN relay RDMA submission failed");
         }
@@ -202,7 +211,16 @@ class RdmaRelayBackend final : public RelayBackend {
    private:
     using MrKey = Transport::Slice::mr_key_t;
 
+    struct SourceRail {
+        std::string device_name;
+        std::string rail;
+        RdmaContext* context;
+        MrKey lkey;
+        int device_id;
+    };
+
     struct TargetRoute {
+        uint32_t source_rail_index;
         uint64_t begin;
         uint64_t end;
         MrKey rkey;
@@ -217,33 +235,58 @@ class RdmaRelayBackend final : public RelayBackend {
     };
 
     RdmaRelayBackend(RdmaTransport& transport, uintptr_t arena_address)
-        : transport_(transport), arena_address_(arena_address) {}
+        : transport_(transport),
+          arena_address_(arena_address),
+          rail_resolver_(globalConfig().pxn_rail_map) {}
 
-    Status initialize(size_t max_inflight) {
+    Status initialize(std::span<const std::string> source_device_names,
+                      std::span<const std::string> source_rails,
+                      size_t max_inflight) {
+        if (source_device_names.empty() ||
+            source_device_names.size() != source_rails.size() ||
+            source_device_names.size() > kMaxRailsPerRank) {
+            return Status::InvalidArgument(
+                "PXN relay source rails are invalid");
+        }
         auto local = transport_.meta()->getSegmentDescByID(LOCAL_SEGMENT_ID);
-        int buffer_id = -1;
-        if (RdmaTransport::selectDevice(local.get(), arena_address_,
-                                        kRequiredArenaSize, buffer_id,
-                                        source_device_id_) != 0) {
-            return Status::AddressNotRegistered(
-                "PXN staging arena is not registered by one RDMA context");
-        }
         const auto& contexts = transport_.getContextList();
-        if (source_device_id_ < 0 ||
-            static_cast<size_t>(source_device_id_) >= contexts.size() ||
-            contexts[source_device_id_] == nullptr ||
-            !contexts[source_device_id_]->active()) {
-            return Status::DeviceNotFound(
-                "PXN staging arena RDMA context is unavailable");
+        for (size_t index = 0; index < source_device_names.size(); ++index) {
+            const auto& source_device_name = source_device_names[index];
+            if (source_device_name.empty() || source_rails[index].empty()) {
+                return Status::InvalidArgument(
+                    "PXN relay source rail must not be empty");
+            }
+            int buffer_id = -1;
+            int device_id = -1;
+            if (RdmaTransport::selectDevice(
+                    local.get(), arena_address_, kRequiredArenaSize,
+                    source_device_name, buffer_id, device_id) != 0) {
+                return Status::AddressNotRegistered(
+                    "PXN staging arena is not registered by " +
+                    source_device_name);
+            }
+            if (device_id < 0 ||
+                static_cast<size_t>(device_id) >= contexts.size() ||
+                contexts[device_id] == nullptr ||
+                !contexts[device_id]->active() ||
+                contexts[device_id]->deviceName() != source_device_name) {
+                return Status::DeviceNotFound(
+                    "PXN staging arena RDMA context mismatch for " +
+                    source_device_name);
+            }
+            const auto& buffer = local->buffers[buffer_id];
+            if (static_cast<size_t>(device_id) >= buffer.lkey.size()) {
+                return Status::AddressNotRegistered(
+                    "PXN staging arena lkey is unavailable for " +
+                    source_device_name);
+            }
+            source_rails_.push_back({source_device_name, source_rails[index],
+                                     contexts[device_id].get(),
+                                     buffer.lkey[device_id], device_id});
+            LOG(INFO) << "PXN relay source rail[" << index << "] is "
+                      << source_device_name << " (canonical "
+                      << source_rails[index] << ")";
         }
-        const auto& buffer = local->buffers[buffer_id];
-        if (static_cast<size_t>(source_device_id_) >= buffer.lkey.size()) {
-            return Status::AddressNotRegistered(
-                "PXN staging arena lkey is unavailable");
-        }
-        source_context_ = contexts[source_device_id_].get();
-        source_device_name_ = source_context_->deviceName();
-        source_lkey_ = buffer.lkey[source_device_id_];
         slice_size_ = globalConfig().slice_size;
         if (slice_size_ == 0) {
             return Status::InvalidArgument("RDMA slice size must be nonzero");
@@ -255,9 +298,13 @@ class RdmaRelayBackend final : public RelayBackend {
         return Status::OK();
     }
 
-    Status resolveRoute(std::string_view session, uint64_t destination,
-                        SessionRoutes*& session_routes,
+    Status resolveRoute(uint32_t source_rail_index, std::string_view session,
+                        uint64_t destination, SessionRoutes*& session_routes,
                         const TargetRoute*& route) {
+        if (source_rail_index >= source_rails_.size()) {
+            return Status::InvalidArgument("PXN relay rail index is invalid");
+        }
+        const auto& source_rail = source_rails_[source_rail_index];
         auto it = sessions_.find(std::string(session));
         if (it == sessions_.end()) {
             const auto target_id =
@@ -278,7 +325,8 @@ class RdmaRelayBackend final : public RelayBackend {
         }
         session_routes = &it->second;
         for (const auto& cached : session_routes->routes) {
-            if (destination >= cached.begin && destination < cached.end) {
+            if (cached.source_rail_index == source_rail_index &&
+                destination >= cached.begin && destination < cached.end) {
                 route = &cached;
                 return Status::OK();
             }
@@ -286,22 +334,34 @@ class RdmaRelayBackend final : public RelayBackend {
 
         int buffer_id = -1;
         int device_id = -1;
-        int result = 0;
-        if (globalConfig().enable_hca_peer_affinity) {
-            result = RdmaTransport::selectDeviceByLocalHca(
-                session_routes->descriptor.get(), destination, 1,
-                source_device_name_, buffer_id, device_id);
-        } else {
-            const auto hint = globalConfig().enable_dest_device_affinity
-                                  ? std::string_view(source_device_name_)
-                                  : std::string_view();
-            result = RdmaTransport::selectDevice(
-                session_routes->descriptor.get(), destination, 1, hint,
-                buffer_id, device_id);
+        auto matches_source_rail = [&]() {
+            const auto& descriptor = *session_routes->descriptor;
+            return device_id >= 0 &&
+                   static_cast<size_t>(device_id) < descriptor.devices.size() &&
+                   rail_resolver_.canonicalize(
+                       descriptor.devices[device_id].name) == source_rail.rail;
+        };
+        int result = RdmaTransport::selectDevice(
+            session_routes->descriptor.get(), destination, 1,
+            source_rail.device_name, buffer_id, device_id);
+        if (result != 0 || !matches_source_rail()) {
+            result = -1;
+            const size_t retry_count =
+                session_routes->descriptor->devices.size() + 1;
+            for (size_t retry = 0; retry < retry_count; ++retry) {
+                if (RdmaTransport::selectDevice(
+                        session_routes->descriptor.get(), destination, 1,
+                        buffer_id, device_id, static_cast<int>(retry)) == 0 &&
+                    matches_source_rail()) {
+                    result = 0;
+                    break;
+                }
+            }
         }
-        if (result != 0) {
+        if (result != 0 || !matches_source_rail()) {
             return Status::AddressNotRegistered(
-                "PXN target address is not registered");
+                "PXN target address is not registered on rail " +
+                source_rail.rail);
         }
         const auto& descriptor = *session_routes->descriptor;
         const auto& buffer = descriptor.buffers[buffer_id];
@@ -312,8 +372,8 @@ class RdmaRelayBackend final : public RelayBackend {
                 "PXN target RDMA route is incomplete");
         }
         session_routes->routes.push_back(
-            {buffer.addr, buffer.addr + buffer.length, buffer.rkey[device_id],
-             device_id,
+            {source_rail_index, buffer.addr, buffer.addr + buffer.length,
+             buffer.rkey[device_id], device_id,
              MakeNicPath(descriptor.nicPathServerName(),
                          descriptor.devices[device_id].name)});
         route = &session_routes->routes.back();
@@ -330,8 +390,9 @@ class RdmaRelayBackend final : public RelayBackend {
             while (remaining != 0) {
                 SessionRoutes* session_routes = nullptr;
                 const TargetRoute* route = nullptr;
-                auto status = resolveRoute(submission.session, destination,
-                                           session_routes, route);
+                auto status =
+                    resolveRoute(submission.rail_index, submission.session,
+                                 destination, session_routes, route);
                 if (!status.ok()) return status;
                 const size_t length = static_cast<size_t>(std::min<uint64_t>(
                     {remaining, slice_size_, route->end - destination}));
@@ -347,10 +408,8 @@ class RdmaRelayBackend final : public RelayBackend {
 
     RdmaTransport& transport_;
     uintptr_t arena_address_;
-    RdmaContext* source_context_ = nullptr;
-    std::string source_device_name_;
-    MrKey source_lkey_ = 0;
-    int source_device_id_ = -1;
+    RailResolver rail_resolver_;
+    std::vector<SourceRail> source_rails_;
     size_t slice_size_ = 0;
     std::shared_ptr<RelaySlicePool> pool_;
     std::unordered_map<std::string, SessionRoutes> sessions_;
@@ -446,6 +505,7 @@ Status RelayPipeline::progressInbound(bool& made_progress) {
             arena_address_ + (lane_index * kSlotsPerLane + slot) * kSlotSize;
         submission.session.assign(descriptor.session,
                                   descriptor.session_length);
+        submission.rail_index = descriptor.rail_index;
         submission.plans.assign(descriptor.plans,
                                 descriptor.plans + descriptor.plan_count);
 
@@ -521,10 +581,13 @@ void PxnPump::run() {
 }
 
 Status makeRdmaRelayBackend(RdmaTransport& transport, uintptr_t arena_address,
+                            std::span<const std::string> source_device_names,
+                            std::span<const std::string> source_rails,
                             size_t max_inflight,
                             std::unique_ptr<RelayBackend>& backend) {
-    return RdmaRelayBackend::Create(transport, arena_address, max_inflight,
-                                    backend);
+    return RdmaRelayBackend::Create(transport, arena_address,
+                                    source_device_names, source_rails,
+                                    max_inflight, backend);
 }
 
 }  // namespace pxn

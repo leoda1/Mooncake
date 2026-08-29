@@ -16,6 +16,7 @@
 
 #include <glog/logging.h>
 
+#include <algorithm>
 #include <limits>
 #include <utility>
 
@@ -211,10 +212,10 @@ void PeerResources::quarantine() {
 
 LocalResources::LocalResources(std::unique_ptr<StagingBackend> backend,
                                std::unique_ptr<Registry> registry,
-                               std::string local_rail)
+                               std::vector<std::string> local_rails)
     : backend_(std::move(backend)),
       registry_(std::move(registry)),
-      local_rail_(std::move(local_rail)) {}
+      local_rails_(std::move(local_rails)) {}
 
 LocalResources::~LocalResources() {
     auto status = shutdown();
@@ -234,9 +235,18 @@ Status LocalResources::Create(
     }
 
     RailResolver resolver(rail_map);
-    auto local_rail = resolver.resolveUnique(local_hcas);
-    if (!local_rail.has_value()) {
-        return Status::InvalidArgument("PXN requires one active local HCA");
+    std::vector<std::string> local_rails;
+    local_rails.reserve(local_hcas.size());
+    for (const auto& hca : local_hcas) {
+        auto rail = resolver.canonicalize(hca);
+        if (rail.empty() || std::find(local_rails.begin(), local_rails.end(),
+                                      rail) != local_rails.end()) {
+            continue;
+        }
+        local_rails.push_back(std::move(rail));
+    }
+    if (local_rails.empty() || local_rails.size() > kMaxRailsPerRank) {
+        return Status::InvalidArgument("PXN requires active local rails");
     }
 
     std::unique_ptr<Registry> registry;
@@ -244,11 +254,11 @@ Status LocalResources::Create(
     if (!status.ok()) return status;
 
     std::unique_ptr<LocalResources> candidate(new LocalResources(
-        std::move(backend), std::move(registry), std::move(*local_rail)));
+        std::move(backend), std::move(registry), std::move(local_rails)));
     status = candidate->arena_.initialize(*candidate->backend_);
     if (!status.ok()) return status;
 
-    status = candidate->registry_->createLocal(candidate->local_rail_,
+    status = candidate->registry_->createLocal(candidate->local_rails_,
                                                candidate->arena_.handle(),
                                                candidate->registration_);
     if (!status.ok()) return status;
@@ -258,6 +268,11 @@ Status LocalResources::Create(
 
     resources = std::move(candidate);
     return Status::OK();
+}
+
+bool LocalResources::ownsRail(std::string_view rail) const {
+    return std::find(local_rails_.begin(), local_rails_.end(), rail) !=
+           local_rails_.end();
 }
 
 Status LocalResources::shutdown() {

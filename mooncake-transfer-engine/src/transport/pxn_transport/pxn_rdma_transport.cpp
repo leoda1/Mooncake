@@ -17,6 +17,7 @@
 #include <cuda_runtime.h>
 #include <glog/logging.h>
 
+#include <algorithm>
 #include <chrono>
 #include <limits>
 #include <string>
@@ -98,7 +99,7 @@ struct PxnRdmaTransport::SelectionContext {
     std::shared_ptr<TransferMetadata::SegmentDesc> local_descriptor;
     std::vector<std::pair<uint64_t, uint64_t>> cuda_source_ranges;
     std::unordered_map<SegmentID, TargetEntry> targets;
-    std::unordered_map<std::string, pxn::SenderLane*> relays;
+    std::unordered_map<std::string, RelayLane> relays;
 
     uint64_t not_write = 0;
     uint64_t not_cuda = 0;
@@ -146,26 +147,53 @@ int PxnRdmaTransport::install(std::string& local_server_name,
         return result;
     }
 
+    const std::string location = "cuda:" + std::to_string(device_id);
+    bool preferred_resolved = active_hcas.size() == 1;
     if (active_hcas.size() > 1 && pxn_topology != nullptr) {
-        const std::string location = "cuda:" + std::to_string(device_id);
-        const int preferred = pxn_topology->selectDevice(location);
-        if (preferred >= 0 &&
-            static_cast<size_t>(preferred) < getContextList().size()) {
-            const auto& context = getContextList()[preferred];
-            if (context != nullptr && context->active()) {
-                LOG(INFO) << "PXN local rail for " << location << " is "
-                          << context->deviceName() << " (of "
-                          << active_hcas.size() << " active HCAs)";
-                active_hcas = {context->deviceName()};
+        const auto matrix = pxn_topology->getMatrix();
+        const auto entry = matrix.find(location);
+        if (entry != matrix.end() && !entry->second.preferred_hca.empty()) {
+            const auto& candidates = entry->second.preferred_hca;
+            std::vector<std::string> local_hcas;
+            for (const auto& candidate : candidates) {
+                if (std::find(active_hcas.begin(), active_hcas.end(),
+                              candidate) != active_hcas.end()) {
+                    local_hcas.push_back(candidate);
+                }
+            }
+            if (!local_hcas.empty()) {
+                active_hcas = std::move(local_hcas);
+                preferred_resolved = true;
             }
         }
-        if (active_hcas.size() > 1) {
-            LOG(WARNING) << "PXN is disabled: cannot pick a local rail for "
-                         << location << " among " << active_hcas.size()
-                         << " active HCAs";
-            return result;
-        }
     }
+    if (active_hcas.empty() || !preferred_resolved) {
+        LOG(WARNING) << "PXN is disabled: cannot resolve preferred HCAs for "
+                     << location;
+        return result;
+    }
+
+    rail_resolver_ =
+        std::make_unique<pxn::RailResolver>(globalConfig().pxn_rail_map);
+    std::vector<std::string> source_hcas;
+    std::vector<std::string> source_rails;
+    for (const auto& hca : active_hcas) {
+        auto rail = rail_resolver_->canonicalize(hca);
+        if (std::find(source_rails.begin(), source_rails.end(), rail) !=
+            source_rails.end()) {
+            continue;
+        }
+        source_hcas.push_back(hca);
+        source_rails.push_back(std::move(rail));
+    }
+    active_hcas = std::move(source_hcas);
+    std::string local_rail_log;
+    for (size_t index = 0; index < active_hcas.size(); ++index) {
+        if (!local_rail_log.empty()) local_rail_log += ", ";
+        local_rail_log += active_hcas[index] + "=" + source_rails[index];
+    }
+    LOG(INFO) << "PXN local rails for " << location << " are ["
+              << local_rail_log << "]";
     pxn::RegistryOptions registry_options;
     registry_options.group_id = globalConfig().pxn_group_id;
     auto backend = pxn::makeCudaRdmaStagingBackend(*this, device_id);
@@ -178,6 +206,7 @@ int PxnRdmaTransport::install(std::string& local_server_name,
     }
     std::unique_ptr<pxn::RelayBackend> relay_backend;
     status = pxn::makeRdmaRelayBackend(*this, resources_->arena().address(),
+                                       active_hcas, resources_->localRails(),
                                        globalConfig().pxn_inflight_depth,
                                        relay_backend);
     if (!status.ok()) {
@@ -185,8 +214,6 @@ int PxnRdmaTransport::install(std::string& local_server_name,
         resources_.reset();
         return result;
     }
-    rail_resolver_ =
-        std::make_unique<pxn::RailResolver>(globalConfig().pxn_rail_map);
     sender_pipeline_ = std::make_unique<pxn::SenderPipeline>(
         pxn::makeCudaSenderBackend(device_id),
         pxn::makeRdmaSenderFallback(*this),
@@ -205,6 +232,7 @@ Status PxnRdmaTransport::submitTransferTask(
 
     struct Group {
         pxn::SenderLane* lane;
+        uint32_t rail_index;
         SegmentID target_id;
         std::string session;
         std::vector<TransferTask*> tasks;
@@ -221,8 +249,9 @@ Status PxnRdmaTransport::submitTransferTask(
     for (auto* task : task_list) {
         std::string session;
         pxn::SenderLane* lane = nullptr;
+        uint32_t rail_index = 0;
         const auto& request = *task->request;
-        if (!selectPxnLane(request, selection, session, lane)) {
+        if (!selectPxnLane(request, selection, session, lane, rail_index)) {
             direct_tasks.push_back(task);
             continue;
         }
@@ -230,12 +259,17 @@ Status PxnRdmaTransport::submitTransferTask(
         size_t index = 0;
         while (index < groups.size() &&
                (groups[index].target_id != request.target_id ||
-                groups[index].lane != lane)) {
+                groups[index].lane != lane ||
+                groups[index].rail_index != rail_index)) {
             ++index;
         }
         if (index == groups.size()) {
-            groups.push_back(
-                {lane, request.target_id, std::move(session), {}, {}});
+            groups.push_back({lane,
+                              rail_index,
+                              request.target_id,
+                              std::move(session),
+                              {},
+                              {}});
         }
         auto& group = groups[index];
         const size_t request_index = group.tasks.size();
@@ -259,6 +293,7 @@ Status PxnRdmaTransport::submitTransferTask(
             pxn::SenderSubmission submission;
             submission.session = group.session;
             submission.target_id = group.target_id;
+            submission.rail_index = group.rail_index;
             submission.slices.reserve(piece.spans.size());
             for (const auto& span : piece.spans) {
                 auto* task = group.tasks[span.request_index];
@@ -306,8 +341,8 @@ Status PxnRdmaTransport::submitTransferTask(
             selection.same_rail, std::memory_order_relaxed);
         if (previous == 0) {
             LOG(WARNING) << "PXN skipped: target rail "
-                         << selection.first_same_rail << " == local rail "
-                         << resources_->localRail()
+                         << selection.first_same_rail
+                         << " is owned by the sender rank"
                          << " (same rail always uses native RDMA)";
         }
     }
@@ -344,7 +379,8 @@ Status PxnRdmaTransport::submitTransferTask(
 bool PxnRdmaTransport::selectPxnLane(const TransferRequest& request,
                                      SelectionContext& context,
                                      std::string& session,
-                                     pxn::SenderLane*& lane) {
+                                     pxn::SenderLane*& lane,
+                                     uint32_t& rail_index) {
     if (request.opcode != TransferRequest::WRITE || request.length == 0) {
         ++context.not_write;
         return false;
@@ -413,7 +449,7 @@ bool PxnRdmaTransport::selectPxnLane(const TransferRequest& request,
             route_end = buffer.addr + buffer.length;
         }
         transient_route = {route_begin, route_end, target_rail,
-                           target_rail == resources_->localRail()};
+                           resources_->ownsRail(target_rail)};
         if (cacheable) {
             target_entry.routes.push_back(transient_route);
             target_route = &target_entry.routes.back();
@@ -465,11 +501,12 @@ bool PxnRdmaTransport::selectPxnLane(const TransferRequest& request,
 
     auto resolved = context.relays.find(target_route->rail);
     if (resolved != context.relays.end()) {
-        if (resolved->second == nullptr) {
+        if (resolved->second.lane == nullptr) {
             ++context.no_relay;
             return false;
         }
-        lane = resolved->second;
+        lane = resolved->second.lane;
+        rail_index = resolved->second.rail_index;
         session = target->name;
         return true;
     }
@@ -477,36 +514,45 @@ bool PxnRdmaTransport::selectPxnLane(const TransferRequest& request,
     std::lock_guard<std::mutex> lock(peer_mutex_);
     auto cached = lanes_by_rail_.find(target_route->rail);
     if (cached != lanes_by_rail_.end()) {
-        lane = cached->second;
-        context.relays[target_route->rail] = lane;
+        lane = cached->second.lane;
+        rail_index = cached->second.rail_index;
+        context.relays[target_route->rail] = cached->second;
         session = target->name;
         return true;
     }
     std::vector<pxn::RegistryEntry> entries;
     if (!resources_->registry().discover(entries).ok()) {
         ++context.no_relay;
-        context.relays[target_route->rail] = nullptr;
+        context.relays[target_route->rail] = {};
         if (context.first_missing_relay.empty()) {
             context.first_missing_relay = target_route->rail;
         }
         return false;
     }
     for (const auto& entry : entries) {
-        if (entry.rail != target_route->rail) continue;
+        const auto rail = std::find(entry.rails.begin(), entry.rails.end(),
+                                    target_route->rail);
+        if (rail == entry.rails.end()) continue;
         pxn::PeerResources* peer = nullptr;
         if (!resources_->mapPeer(entry, peer).ok()) return false;
         if (!sender_pipeline_->addPeer(*peer, lane).ok()) return false;
-        lanes_by_rail_[target_route->rail] = lane;
-        context.relays[target_route->rail] = lane;
+        for (size_t index = 0; index < entry.rails.size(); ++index) {
+            lanes_by_rail_[entry.rails[index]] = {lane,
+                                                  static_cast<uint32_t>(index)};
+        }
+        rail_index = static_cast<uint32_t>(rail - entry.rails.begin());
+        context.relays[target_route->rail] = {lane, rail_index};
         session = target->name;
         return true;
     }
     ++context.no_relay;
-    context.relays[target_route->rail] = nullptr;
+    context.relays[target_route->rail] = {};
     if (context.first_missing_relay.empty()) {
         context.first_missing_relay = target_route->rail;
         std::string rails;
-        for (const auto& e : entries) rails += e.rail + " ";
+        for (const auto& entry : entries) {
+            for (const auto& rail : entry.rails) rails += rail + " ";
+        }
         context.first_registry_rails = std::move(rails);
     }
     return false;

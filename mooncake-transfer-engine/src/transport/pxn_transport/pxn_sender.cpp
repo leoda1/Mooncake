@@ -359,9 +359,10 @@ Status SenderLane::publish(QueuedSubmission submission, uint64_t sequence,
     }
 
     auto& lane = endpoint_.control->lanes[endpoint_.lane_index];
-    auto status = prepareDescriptor(submission.submission.piece,
-                                    submission.submission.session,
-                                    endpoint_.epoch, lane.descriptors[*slot]);
+    auto status = prepareDescriptor(
+        submission.submission.piece, submission.submission.session,
+        endpoint_.epoch, submission.submission.rail_index,
+        lane.descriptors[*slot]);
     if (!status.ok()) {
         auto fallback_status = deferOrStartFallback(std::move(submission));
         return fallback_status.ok() ? status : fallback_status;

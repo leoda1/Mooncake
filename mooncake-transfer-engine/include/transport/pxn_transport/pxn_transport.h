@@ -27,6 +27,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -164,14 +165,16 @@ class LocalResources {
 
     Status shutdown();
     Status mapPeer(const RegistryEntry& entry, PeerResources*& peer);
-    const std::string& localRail() const { return local_rail_; }
+    const std::vector<std::string>& localRails() const { return local_rails_; }
+    bool ownsRail(std::string_view rail) const;
     Registry& registry() const { return *registry_; }
     RegistryRegistration& registration() const { return *registration_; }
     StagingArena& arena() { return arena_; }
 
    private:
     LocalResources(std::unique_ptr<StagingBackend> backend,
-                   std::unique_ptr<Registry> registry, std::string local_rail);
+                   std::unique_ptr<Registry> registry,
+                   std::vector<std::string> local_rails);
 
     void quarantine();
 
@@ -180,7 +183,7 @@ class LocalResources {
     std::unique_ptr<RegistryRegistration> registration_;
     StagingArena arena_;
     std::vector<std::unique_ptr<PeerResources>> peers_;
-    std::string local_rail_;
+    std::vector<std::string> local_rails_;
     bool shutdown_ = false;
     QuarantineLatch quarantine_;
 };
@@ -197,6 +200,7 @@ struct SenderSubmission {
     Piece piece;
     std::string session;
     uint64_t target_id = 0;
+    uint32_t rail_index = 0;
     std::vector<LogicalSlice> slices;
 };
 
@@ -370,6 +374,7 @@ class SenderPipeline {
 struct RelaySubmission {
     uintptr_t source = 0;
     std::string session;
+    uint32_t rail_index = 0;
     std::vector<PlanEntry> plans;
 };
 
@@ -449,6 +454,8 @@ std::unique_ptr<SenderBackend> makeCudaSenderBackend(int device_id);
 std::unique_ptr<SenderFallback> makeRdmaSenderFallback(
     RdmaTransport& transport);
 Status makeRdmaRelayBackend(RdmaTransport& transport, uintptr_t arena_address,
+                            std::span<const std::string> source_device_names,
+                            std::span<const std::string> source_rails,
                             size_t max_inflight,
                             std::unique_ptr<RelayBackend>& backend);
 

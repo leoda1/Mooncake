@@ -120,13 +120,17 @@ Status buildPieces(std::span<const TransferSpan> spans,
 }
 
 Status prepareDescriptor(const Piece& piece, std::string_view session,
-                         uint64_t epoch, Descriptor& descriptor) {
+                         uint64_t epoch, uint32_t rail_index,
+                         Descriptor& descriptor) {
     auto status = validatePiece(piece);
     if (!status.ok()) return status;
     if (session.empty() || session.size() > kMaxSessionLength) {
         return Status::InvalidArgument("invalid PXN session length");
     }
     if (epoch == 0) return Status::InvalidArgument("invalid PXN epoch");
+    if (rail_index >= kMaxRailsPerRank) {
+        return Status::InvalidArgument("invalid PXN rail index");
+    }
 
     constexpr size_t kPayloadOffset = offsetof(Descriptor, epoch);
     std::memset(reinterpret_cast<char*>(&descriptor) + kPayloadOffset, 0,
@@ -135,6 +139,7 @@ Status prepareDescriptor(const Piece& piece, std::string_view session,
     descriptor.piece_length = static_cast<uint32_t>(piece.length);
     descriptor.plan_count = static_cast<uint32_t>(piece.spans.size());
     descriptor.session_length = static_cast<uint32_t>(session.size());
+    descriptor.rail_index = rail_index;
     std::memcpy(descriptor.session, session.data(), session.size());
     for (size_t i = 0; i < piece.spans.size(); ++i) {
         descriptor.plans[i] = {piece.spans[i].final_destination,
@@ -173,7 +178,9 @@ DescriptorError validateDescriptor(const Descriptor& descriptor,
         descriptor.session_length > kMaxSessionLength) {
         return DescriptorError::kSessionLength;
     }
-    if (descriptor.reserved != 0) return DescriptorError::kReserved;
+    if (descriptor.rail_index >= kMaxRailsPerRank) {
+        return DescriptorError::kRailIndex;
+    }
 
     uint64_t total = 0;
     for (size_t i = 0; i < descriptor.plan_count; ++i) {

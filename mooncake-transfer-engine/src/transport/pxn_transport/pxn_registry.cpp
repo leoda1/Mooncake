@@ -122,6 +122,58 @@ Status validateLockFile(int fd) {
     return validateRegularFile(fd, std::nullopt, "invalid PXN registry lock");
 }
 
+Status encodeRails(std::span<const std::string> rails, std::string& encoded) {
+    if (rails.empty() || rails.size() > kMaxRailsPerRank) {
+        return Status::InvalidArgument("invalid PXN rail count");
+    }
+    encoded.clear();
+    for (size_t index = 0; index < rails.size(); ++index) {
+        const auto& rail = rails[index];
+        if (rail.empty() || rail.find('\0') != std::string::npos ||
+            std::find(rails.begin(), rails.begin() + index, rail) !=
+                rails.begin() + index) {
+            return Status::InvalidArgument("invalid PXN rail name");
+        }
+        if (rail.size() + 1 > kMaxRailNameLength - encoded.size()) {
+            return Status::InvalidArgument("PXN rail list is too long");
+        }
+        encoded.append(rail);
+        encoded.push_back('\0');
+    }
+    return Status::OK();
+}
+
+Status decodeRails(const RegistryHeader& header,
+                   std::vector<std::string>& rails) {
+    rails.clear();
+    if (header.rail_count == 0 || header.rail_count > kMaxRailsPerRank ||
+        header.rail_bytes == 0 || header.rail_bytes > kMaxRailNameLength) {
+        return Status::InvalidArgument("invalid PXN rail list");
+    }
+    size_t begin = 0;
+    for (uint32_t index = 0; index < header.rail_count; ++index) {
+        const void* terminator =
+            std::memchr(header.rail + begin, '\0', header.rail_bytes - begin);
+        if (terminator == nullptr) {
+            return Status::InvalidArgument("invalid PXN rail list");
+        }
+        const size_t end = static_cast<const char*>(terminator) - header.rail;
+        if (end == begin) {
+            return Status::InvalidArgument("invalid PXN rail name");
+        }
+        rails.emplace_back(header.rail + begin, end - begin);
+        if (std::find(rails.begin(), rails.end() - 1, rails.back()) !=
+            rails.end() - 1) {
+            return Status::InvalidArgument("duplicate PXN rail name");
+        }
+        begin = end + 1;
+    }
+    if (begin != header.rail_bytes) {
+        return Status::InvalidArgument("invalid PXN rail list length");
+    }
+    return Status::OK();
+}
+
 Status validateRegistryHeader(const RegistryHeader& header) {
     if (header.magic != kRegistryMagic ||
         header.abi_version != kRegistryAbiVersion ||
@@ -132,11 +184,14 @@ Status validateRegistryHeader(const RegistryHeader& header) {
         header.lane_count != kLaneCount ||
         header.slots_per_lane != kSlotsPerLane ||
         header.slot_size != kSlotSize ||
-        header.arena_size != kRequiredArenaSize || header.rail_bytes == 0 ||
-        header.rail_bytes > kMaxRailNameLength ||
-        header.ipc_handle_bytes != kCudaIpcHandleSize || header.reserved != 0 ||
+        header.arena_size != kRequiredArenaSize ||
+        header.ipc_handle_bytes != kCudaIpcHandleSize ||
         !std::all_of(std::begin(header.padding), std::end(header.padding),
                      [](uint8_t byte) { return byte == 0; })) {
+        return Status::InvalidArgument("incompatible PXN registry entry");
+    }
+    std::vector<std::string> rails;
+    if (!decodeRails(header, rails).ok()) {
         return Status::InvalidArgument("incompatible PXN registry entry");
     }
     return Status::OK();
@@ -348,7 +403,13 @@ Status scanEntriesLocked(int directory_fd, const ProcessProbe& process_probe,
         RegistryEntry entry;
         entry.identity = owner;
         entry.epoch = header->epoch;
-        entry.rail.assign(header->rail, header->rail_bytes);
+        status = decodeRails(*header, entry.rails);
+        if (!status.ok()) {
+            munmap(header, sizeof(RegistryHeader));
+            close(fd);
+            result = std::move(status);
+            break;
+        }
         entry.arena_handle = header->arena_handle;
         entry.file_name.assign(name);
         entries.push_back(std::move(entry));
@@ -388,10 +449,11 @@ Status validateMappedPeer(const ControlBlock& control,
     }
     auto status = validateRegistryHeader(control.header);
     if (!status.ok()) return status;
+    std::vector<std::string> rails;
+    status = decodeRails(control.header, rails);
+    if (!status.ok()) return status;
     if (control.header.owner != entry.identity ||
-        control.header.epoch != entry.epoch ||
-        std::string_view(control.header.rail, control.header.rail_bytes) !=
-            entry.rail ||
+        control.header.epoch != entry.epoch || rails != entry.rails ||
         control.header.arena_handle != entry.arena_handle) {
         return Status::InvalidArgument("PXN registry peer changed");
     }
@@ -916,11 +978,11 @@ Status Registry::Open(RegistryOptions options,
 }
 
 Status Registry::createLocal(
-    std::string_view rail, const CudaIpcHandle& arena_handle,
+    std::span<const std::string> rails, const CudaIpcHandle& arena_handle,
     std::unique_ptr<RegistryRegistration>& registration) {
-    if (rail.empty() || rail.size() > kMaxRailNameLength) {
-        return Status::InvalidArgument("invalid PXN rail name");
-    }
+    std::string encoded_rails;
+    auto status = encodeRails(rails, encoded_rails);
+    if (!status.ok()) return status;
 
     const std::string temporary_name = makeEntryName(identity_, epoch_, true);
     const std::string final_name = makeEntryName(identity_, epoch_, false);
@@ -937,7 +999,7 @@ Status Registry::createLocal(
         unlinkat(directory_fd_, temporary_name.c_str(), 0);
         return systemError("resize PXN registry entry failed", error);
     }
-    auto status = validateControlFile(fd);
+    status = validateControlFile(fd);
     if (!status.ok()) {
         close(fd);
         unlinkat(directory_fd_, temporary_name.c_str(), 0);
@@ -965,9 +1027,11 @@ Status Registry::createLocal(
     control->header.slots_per_lane = kSlotsPerLane;
     control->header.slot_size = kSlotSize;
     control->header.arena_size = kRequiredArenaSize;
-    control->header.rail_bytes = static_cast<uint32_t>(rail.size());
+    control->header.rail_bytes = static_cast<uint32_t>(encoded_rails.size());
+    control->header.rail_count = static_cast<uint32_t>(rails.size());
     control->header.ipc_handle_bytes = kCudaIpcHandleSize;
-    std::memcpy(control->header.rail, rail.data(), rail.size());
+    std::memcpy(control->header.rail, encoded_rails.data(),
+                encoded_rails.size());
     control->header.arena_handle = arena_handle;
 
     int registration_directory_fd = duplicateFd(directory_fd_);
