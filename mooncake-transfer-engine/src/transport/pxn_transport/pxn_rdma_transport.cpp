@@ -57,9 +57,9 @@ bool covers(uint64_t begin, uint64_t end, uint64_t address, size_t length) {
            length <= end - begin && address - begin <= end - begin - length;
 }
 
-bool hasUniqueCanonicalRail(const Topology& topology, std::string_view location,
-                            const pxn::RailResolver& resolver,
-                            std::string_view expected_rail) {
+std::vector<std::string> canonicalRails(const Topology& topology,
+                                        std::string_view location,
+                                        const pxn::RailResolver& resolver) {
     const auto matrix = topology.getMatrix();
     const std::vector<std::string>* candidates = nullptr;
     auto entry = matrix.find(std::string(location));
@@ -72,11 +72,16 @@ bool hasUniqueCanonicalRail(const Topology& topology, std::string_view location,
     }
     const auto& wildcard_candidates = topology.getHcaList();
     if (candidates == nullptr) candidates = &wildcard_candidates;
-    if (candidates->empty()) return false;
+    std::vector<std::string> rails;
     for (const auto& candidate : *candidates) {
-        if (resolver.canonicalize(candidate) != expected_rail) return false;
+        auto rail = resolver.canonicalize(candidate);
+        if (rail.empty() ||
+            std::find(rails.begin(), rails.end(), rail) != rails.end()) {
+            continue;
+        }
+        rails.push_back(std::move(rail));
     }
-    return true;
+    return rails;
 }
 
 }  // namespace
@@ -90,9 +95,16 @@ struct PxnRdmaTransport::SelectionContext {
     };
 
     struct TargetEntry {
+        struct RouteSet {
+            uint64_t begin = 0;
+            uint64_t end = 0;
+            std::vector<TargetRoute> routes;
+            size_t next = 0;
+        };
+
         bool loaded = false;
         std::shared_ptr<TransferMetadata::SegmentDesc> descriptor;
-        std::vector<TargetRoute> routes;
+        std::vector<RouteSet> route_sets;
     };
 
     bool local_loaded = false;
@@ -362,17 +374,31 @@ Status PxnRdmaTransport::submitTransferTask(
     add_stat(pxn_stats_.pxn_bytes, pxn_bytes);
     add_stat(pxn_stats_.route_cache_hit, selection.route_cache_hit);
     add_stat(pxn_stats_.route_cache_miss, selection.route_cache_miss);
-    reportPxnStats();
 
     Status result;
     if (!direct_tasks.empty()) {
         result = RdmaTransport::submitTransferTask(direct_tasks);
     }
     for (auto& item : pending) {
+        const uint64_t bytes = item.submission.piece.length;
+        const uint64_t source_spans = item.submission.piece.spans.size();
         auto status = item.lane->enqueue(std::move(item.submission));
         if (result.ok() && !status.ok()) result = status;
+        if (!status.ok()) continue;
+        add_stat(pxn_stats_.enqueued_bytes, bytes);
+        add_stat(pxn_stats_.enqueued_pieces, 1);
+        add_stat(pxn_stats_.source_spans, source_spans);
+        auto update_max = [](std::atomic<uint64_t>& counter, uint64_t value) {
+            uint64_t current = counter.load(std::memory_order_relaxed);
+            while (current < value &&
+                   !counter.compare_exchange_weak(current, value,
+                                                  std::memory_order_relaxed)) {
+            }
+        };
+        update_max(pxn_stats_.max_source_spans, source_spans);
     }
     if (!pending.empty()) pump_->wake();
+    reportPxnStats();
     return result;
 }
 
@@ -401,10 +427,12 @@ bool PxnRdmaTransport::selectPxnLane(const TransferRequest& request,
 
     SelectionContext::TargetRoute transient_route;
     const SelectionContext::TargetRoute* target_route = nullptr;
-    for (const auto& cached : target_entry.routes) {
+    for (auto& cached : target_entry.route_sets) {
         if (covers(cached.begin, cached.end, request.target_offset,
-                   request.length)) {
-            target_route = &cached;
+                   request.length) &&
+            !cached.routes.empty()) {
+            target_route = &cached.routes[cached.next % cached.routes.size()];
+            cached.next = (cached.next + 1) % cached.routes.size();
             ++context.route_cache_hit;
             break;
         }
@@ -437,12 +465,8 @@ bool PxnRdmaTransport::selectPxnLane(const TransferRequest& request,
                 : buffer.name;
         const std::string target_rail =
             rail_resolver_->canonicalize(target->devices[device_id].name);
-        // Pin the whole buffer only when doing so preserves selectDevice()'s
-        // multi-HCA routing. Segmented or multi-rail buffers stay uncached.
         const bool cacheable =
             !segmented &&
-            hasUniqueCanonicalRail(target->topology, location, *rail_resolver_,
-                                   target_rail) &&
             buffer.addr <= std::numeric_limits<uint64_t>::max() - buffer.length;
         if (cacheable) {
             route_begin = buffer.addr;
@@ -451,8 +475,26 @@ bool PxnRdmaTransport::selectPxnLane(const TransferRequest& request,
         transient_route = {route_begin, route_end, target_rail,
                            resources_->ownsRail(target_rail)};
         if (cacheable) {
-            target_entry.routes.push_back(transient_route);
-            target_route = &target_entry.routes.back();
+            auto rails =
+                canonicalRails(target->topology, location, *rail_resolver_);
+            auto selected = std::find(rails.begin(), rails.end(), target_rail);
+            if (selected != rails.end()) {
+                std::rotate(rails.begin(), selected, rails.end());
+            } else {
+                rails.insert(rails.begin(), target_rail);
+            }
+
+            SelectionContext::TargetEntry::RouteSet route_set;
+            route_set.begin = route_begin;
+            route_set.end = route_end;
+            route_set.routes.reserve(rails.size());
+            for (auto& rail : rails) {
+                route_set.routes.push_back(
+                    {route_begin, route_end, rail, resources_->ownsRail(rail)});
+            }
+            route_set.next = route_set.routes.size() > 1 ? 1 : 0;
+            target_entry.route_sets.push_back(std::move(route_set));
+            target_route = &target_entry.route_sets.back().routes.front();
         } else {
             target_route = &transient_route;
         }
@@ -561,17 +603,32 @@ bool PxnRdmaTransport::selectPxnLane(const TransferRequest& request,
 void PxnRdmaTransport::reportPxnStats() {
     const uint64_t n = pxn_stats_.reported.fetch_add(1) + 1;
     if (n % 200 != 0) return;
-    LOG(INFO) << "PXN stats: used=" << pxn_stats_.pxn_used.load()
-              << " pxn_bytes=" << pxn_stats_.pxn_bytes.load()
-              << " direct_bytes=" << pxn_stats_.direct_bytes.load()
-              << " | skipped: same_rail=" << pxn_stats_.same_rail.load()
-              << " no_relay=" << pxn_stats_.no_relay.load()
-              << " not_cuda=" << pxn_stats_.not_cuda.load()
-              << " no_device=" << pxn_stats_.no_device.load()
-              << " no_target=" << pxn_stats_.no_target.load()
-              << " not_write=" << pxn_stats_.not_write.load()
-              << " | route_cache: hit=" << pxn_stats_.route_cache_hit.load()
-              << " miss=" << pxn_stats_.route_cache_miss.load();
+    const uint64_t enqueued_pieces = pxn_stats_.enqueued_pieces.load();
+    const uint64_t source_spans = pxn_stats_.source_spans.load();
+    LOG(INFO)
+        << "PXN stats: used=" << pxn_stats_.pxn_used.load()
+        << " pxn_bytes=" << pxn_stats_.pxn_bytes.load()
+        << " direct_bytes=" << pxn_stats_.direct_bytes.load()
+        << " | pipeline: tx_enqueued_bytes=" << pxn_stats_.enqueued_bytes.load()
+        << " tx_pieces=" << enqueued_pieces
+        << " relay_ready_bytes=" << relay_pipeline_->readyBytes()
+        << " relay_ready_pieces=" << relay_pipeline_->readyPieces()
+        << " relay_submitted_bytes=" << relay_pipeline_->submittedBytes()
+        << " relay_submitted_pieces=" << relay_pipeline_->submittedPieces()
+        << " relay_completed_bytes=" << relay_pipeline_->relayedBytes()
+        << " relay_completed_pieces=" << relay_pipeline_->relayedPieces()
+        << " | shape: copy_spans_total=" << source_spans
+        << " copy_spans_avg_x100="
+        << (enqueued_pieces == 0 ? 0 : source_spans * 100 / enqueued_pieces)
+        << " copy_spans_max=" << pxn_stats_.max_source_spans.load()
+        << " | skipped: same_rail=" << pxn_stats_.same_rail.load()
+        << " no_relay=" << pxn_stats_.no_relay.load()
+        << " not_cuda=" << pxn_stats_.not_cuda.load()
+        << " no_device=" << pxn_stats_.no_device.load()
+        << " no_target=" << pxn_stats_.no_target.load()
+        << " not_write=" << pxn_stats_.not_write.load()
+        << " | route_cache: hit=" << pxn_stats_.route_cache_hit.load()
+        << " miss=" << pxn_stats_.route_cache_miss.load();
 }
 
 }  // namespace mooncake

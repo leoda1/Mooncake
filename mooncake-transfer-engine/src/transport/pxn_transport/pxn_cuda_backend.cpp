@@ -19,6 +19,7 @@
 #include <glog/logging.h>
 
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -39,6 +40,8 @@ constexpr CUdevice_attribute kCanUseStreamMemOpsAttribute =
     CU_DEVICE_ATTRIBUTE_CAN_USE_STREAM_MEM_OPS;
 #endif
 
+thread_local int bound_cuda_device = -1;
+
 Status cudaError(std::string_view operation, cudaError_t error) {
     return Status::Memory(std::string(operation) + ": " +
                           cudaGetErrorString(error));
@@ -55,6 +58,7 @@ Status driverError(std::string_view operation, CUresult error) {
 class CudaDeviceScope {
    public:
     explicit CudaDeviceScope(int device_id) {
+        if (bound_cuda_device == device_id) return;
         auto error = cudaGetDevice(&previous_device_);
         if (error != cudaSuccess) {
             status_ = cudaError("cudaGetDevice failed", error);
@@ -84,6 +88,37 @@ class CudaDeviceScope {
     int previous_device_ = -1;
     bool restore_ = false;
     Status status_;
+};
+
+class CudaEventPool {
+   public:
+    explicit CudaEventPool(int device_id) : device_id_(device_id) {}
+
+    ~CudaEventPool() {
+        CudaDeviceScope device(device_id_);
+        if (!device.status().ok()) return;
+        for (auto event : events_) (void)cudaEventDestroy(event);
+    }
+
+    cudaError_t acquire(cudaEvent_t& event) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (events_.empty()) {
+            return cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
+        }
+        event = events_.back();
+        events_.pop_back();
+        return cudaSuccess;
+    }
+
+    void release(cudaEvent_t event) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        events_.push_back(event);
+    }
+
+   private:
+    int device_id_;
+    std::mutex mutex_;
+    std::vector<cudaEvent_t> events_;
 };
 
 class CudaRdmaStagingBackend final : public StagingBackend {
@@ -180,24 +215,19 @@ class CudaRdmaStagingBackend final : public StagingBackend {
 
 class CudaReadyFence final : public SenderReadyFence {
    public:
-    CudaReadyFence(int device_id, cudaEvent_t event)
-        : device_id_(device_id), event_(event) {}
+    CudaReadyFence(std::shared_ptr<CudaEventPool> pool, cudaEvent_t event)
+        : pool_(std::move(pool)), event_(event) {}
 
     ~CudaReadyFence() override {
         if (event_ == nullptr) return;
-        CudaDeviceScope device(device_id_);
-        if (!device.status().ok()) return;
-        auto error = cudaEventDestroy(event_);
-        if (error != cudaSuccess) {
-            LOG(ERROR) << "Failed to destroy PXN ready event: "
-                       << cudaGetErrorString(error);
-        }
+        // cudaStreamWaitEvent captures the record state before this reuse.
+        pool_->release(event_);
     }
 
     cudaEvent_t event() const { return event_; }
 
    private:
-    int device_id_;
+    std::shared_ptr<CudaEventPool> pool_;
     cudaEvent_t event_;
 };
 
@@ -232,7 +262,17 @@ class CudaSenderLaneHandle final : public SenderLaneHandle {
 
 class CudaSenderBackend final : public SenderBackend {
    public:
-    explicit CudaSenderBackend(int device_id) : device_id_(device_id) {}
+    explicit CudaSenderBackend(int device_id)
+        : device_id_(device_id),
+          event_pool_(std::make_shared<CudaEventPool>(device_id)) {}
+
+    Status bindThread() override {
+        auto error = cudaSetDevice(device_id_);
+        if (error != cudaSuccess)
+            return cudaError("cudaSetDevice failed", error);
+        bound_cuda_device = device_id_;
+        return Status::OK();
+    }
 
     Status createLane(const SenderLaneEndpoint& endpoint,
                       std::unique_ptr<SenderLaneHandle>& handle) override {
@@ -270,8 +310,7 @@ class CudaSenderBackend final : public SenderBackend {
         int stream_mem_ops = 0;
         CUdevice cuda_device;
         if (cuDeviceGet(&cuda_device, device_id_) == CUDA_SUCCESS &&
-            cuDeviceGetAttribute(&stream_mem_ops,
-                                 kCanUseStreamMemOpsAttribute,
+            cuDeviceGetAttribute(&stream_mem_ops, kCanUseStreamMemOpsAttribute,
                                  cuda_device) == CUDA_SUCCESS &&
             stream_mem_ops != 0) {
             candidate->stream_mem_ops_ = true;
@@ -282,6 +321,11 @@ class CudaSenderBackend final : public SenderBackend {
                 return cudaError("cudaEventCreateWithFlags failed", error);
             }
         }
+        LOG(INFO) << "PXN CUDA sender lane " << endpoint.lane_index
+                  << " stream_mem_ops=" << candidate->stream_mem_ops_
+                  << ", doorbell="
+                  << (candidate->stream_mem_ops_ ? "cuStreamWriteValue64"
+                                                 : "cudaEvent+CPU poll");
 
         handle = std::move(candidate);
         return Status::OK();
@@ -291,9 +335,9 @@ class CudaSenderBackend final : public SenderBackend {
         CudaDeviceScope device(device_id_);
         if (!device.status().ok()) return device.status();
         cudaEvent_t event = nullptr;
-        auto error = cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
+        auto error = event_pool_->acquire(event);
         if (error != cudaSuccess) {
-            return cudaError("cudaEventCreateWithFlags failed", error);
+            return cudaError("acquire CUDA ready event failed", error);
         }
         error = cudaEventRecord(event, cudaStreamPerThread);
         if (error != cudaSuccess) {
@@ -302,10 +346,10 @@ class CudaSenderBackend final : public SenderBackend {
             if (error != cudaSuccess) {
                 return cudaError("cudaStreamSynchronize failed", error);
             }
-            fence = std::make_unique<CudaReadyFence>(device_id_, nullptr);
+            fence = std::make_unique<CudaReadyFence>(event_pool_, nullptr);
             return Status::OK();
         }
-        fence = std::make_unique<CudaReadyFence>(device_id_, event);
+        fence = std::make_unique<CudaReadyFence>(event_pool_, event);
         return Status::OK();
     }
 
@@ -431,6 +475,7 @@ class CudaSenderBackend final : public SenderBackend {
 
    private:
     int device_id_;
+    std::shared_ptr<CudaEventPool> event_pool_;
 };
 
 }  // namespace

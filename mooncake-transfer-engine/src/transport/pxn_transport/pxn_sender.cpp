@@ -144,6 +144,19 @@ Status SenderLane::reap(bool& made_progress) {
 Status SenderLane::progress(bool& made_progress) {
     made_progress = false;
     Status first_error;
+    for (size_t count = 0; count < kSlotsPerLane; ++count) {
+        bool progress = false;
+        auto status = progressOne(progress);
+        if (first_error.ok() && !status.ok()) first_error = status;
+        made_progress = made_progress || progress;
+        if (!status.ok() || !progress) break;
+    }
+    return first_error;
+}
+
+Status SenderLane::progressOne(bool& made_progress) {
+    made_progress = false;
+    Status first_error;
     bool fallback_progress = false;
     auto status = pollFallbacks(fallback_progress);
     if (!status.ok()) first_error = status;
@@ -475,7 +488,8 @@ Status SenderPipeline::addPeer(PeerResources& peer, SenderLane*& lane) {
 Status SenderPipeline::reapOutbound(bool& made_progress) {
     made_progress = false;
     Status first_error;
-    std::vector<SenderLane*> lanes;
+    thread_local std::vector<SenderLane*> lanes;
+    lanes.clear();
     {
         std::lock_guard<std::mutex> lock(lanes_mutex_);
         lanes.reserve(lanes_.size());
@@ -487,20 +501,40 @@ Status SenderPipeline::reapOutbound(bool& made_progress) {
         if (first_error.ok() && !status.ok()) first_error = status;
         made_progress = made_progress || lane_progress;
     }
+    has_inflight_ = std::any_of(lanes.begin(), lanes.end(), [](auto* lane) {
+        return lane->inflightCount() != 0;
+    });
     return first_error;
 }
 
+Status SenderPipeline::bindThread() { return backend_->bindThread(); }
+
 Status SenderPipeline::progressOutbound(bool& made_progress) {
     made_progress = false;
-    SenderLane* lane = nullptr;
+    Status first_error;
+    thread_local std::vector<SenderLane*> lanes;
+    lanes.clear();
+    size_t start = 0;
     {
         std::lock_guard<std::mutex> lock(lanes_mutex_);
         if (lanes_.empty()) return Status::OK();
         if (next_lane_ >= lanes_.size()) next_lane_ = 0;
-        lane = lanes_[next_lane_].get();
+        start = next_lane_;
         next_lane_ = (next_lane_ + 1) % lanes_.size();
+        lanes.reserve(lanes_.size());
+        for (const auto& lane : lanes_) lanes.push_back(lane.get());
     }
-    return lane->progress(made_progress);
+    for (size_t offset = 0; offset < lanes.size(); ++offset) {
+        bool lane_progress = false;
+        auto status =
+            lanes[(start + offset) % lanes.size()]->progress(lane_progress);
+        if (first_error.ok() && !status.ok()) first_error = status;
+        made_progress = made_progress || lane_progress;
+    }
+    has_inflight_ = std::any_of(lanes.begin(), lanes.end(), [](auto* lane) {
+        return lane->inflightCount() != 0;
+    });
+    return first_error;
 }
 
 uint64_t SenderPipeline::fallbackBytes() {

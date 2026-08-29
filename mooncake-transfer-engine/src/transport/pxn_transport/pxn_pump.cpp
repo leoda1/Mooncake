@@ -435,30 +435,43 @@ Status RelayPipeline::reapInbound(bool& made_progress) {
     Status first_error;
     for (size_t lane_index = 0; lane_index < kLaneCount; ++lane_index) {
         auto& queue = inflight_[lane_index];
-        if (queue.empty()) continue;
+        while (!queue.empty()) {
+            bool completed = false;
+            int32_t completion_status = 0;
+            auto status =
+                queue.front().transfer->poll(completed, completion_status);
+            if (!status.ok()) {
+                queue.front().transfer->abandon();
+                (void)queue.front().transfer.release();
+                completed = true;
+                completion_status = ERR_CONTEXT;
+                if (first_error.ok()) first_error = status;
+            }
+            if (!completed) break;
 
-        bool completed = false;
-        int32_t completion_status = 0;
-        auto status =
-            queue.front().transfer->poll(completed, completion_status);
-        if (!status.ok()) {
-            queue.front().transfer->abandon();
-            (void)queue.front().transfer.release();
-            completed = true;
-            completion_status = ERR_CONTEXT;
-            first_error = status;
+            complete(lane_index, queue.front().sequence, completion_status);
+            queue.pop_front();
+            --inflight_count_;
+            made_progress = true;
         }
-        if (!completed) continue;
-
-        complete(lane_index, queue.front().sequence, completion_status);
-        queue.pop_front();
-        --inflight_count_;
-        made_progress = true;
     }
     return first_error;
 }
 
 Status RelayPipeline::progressInbound(bool& made_progress) {
+    made_progress = false;
+    Status first_error;
+    while (inflight_count_ < max_inflight_) {
+        bool progress = false;
+        auto status = progressInboundOne(progress);
+        if (first_error.ok() && !status.ok()) first_error = status;
+        made_progress = made_progress || progress;
+        if (!status.ok() || !progress) break;
+    }
+    return first_error;
+}
+
+Status RelayPipeline::progressInboundOne(bool& made_progress) {
     made_progress = false;
     if (inflight_count_ >= max_inflight_) return Status::OK();
 
@@ -508,11 +521,18 @@ Status RelayPipeline::progressInbound(bool& made_progress) {
         submission.rail_index = descriptor.rail_index;
         submission.plans.assign(descriptor.plans,
                                 descriptor.plans + descriptor.plan_count);
+        ready_bytes_.fetch_add(descriptor.piece_length,
+                               std::memory_order_relaxed);
+        ready_pieces_.fetch_add(1, std::memory_order_relaxed);
 
         std::unique_ptr<RelayTransfer> transfer;
         auto status = backend_->submit(submission, transfer);
         if (!status.ok()) {
             transfer = std::make_unique<CompletedRelayTransfer>(ERR_CONTEXT);
+        } else {
+            submitted_bytes_.fetch_add(descriptor.piece_length,
+                                       std::memory_order_relaxed);
+            submitted_pieces_.fetch_add(1, std::memory_order_relaxed);
         }
         inflight_[lane_index].push_back({sequence, std::move(transfer)});
         ++inflight_count_;
@@ -542,40 +562,63 @@ void RelayPipeline::complete(size_t lane_index, uint64_t sequence,
     if (status == 0) {
         relayed_bytes_.fetch_add(lane.descriptors[slot].piece_length,
                                  std::memory_order_relaxed);
+        relayed_pieces_.fetch_add(1, std::memory_order_relaxed);
     }
     (void)commitCompletion(lane.completions[slot], sequence, status);
     __atomic_store_n(&lane.header.completed, sequence, __ATOMIC_RELEASE);
 }
 
 PxnPump::PxnPump(SenderPipeline& sender, RelayPipeline& relay)
-    : sender_(sender), relay_(relay), thread_(&PxnPump::run, this) {}
+    : sender_(sender), relay_(relay) {
+    sender_thread_ = std::thread(&PxnPump::runSender, this);
+    relay_thread_ = std::thread(&PxnPump::runRelay, this);
+}
 
 PxnPump::~PxnPump() { shutdown(); }
 
-void PxnPump::wake() { condition_.notify_one(); }
+void PxnPump::wake() { sender_condition_.notify_one(); }
 
 void PxnPump::shutdown() {
     if (!running_.exchange(false)) return;
-    condition_.notify_one();
-    if (thread_.joinable()) thread_.join();
+    sender_condition_.notify_one();
+    relay_condition_.notify_one();
+    if (sender_thread_.joinable()) sender_thread_.join();
+    if (relay_thread_.joinable()) relay_thread_.join();
 }
 
-void PxnPump::run() {
+void PxnPump::runSender() {
+    auto bind_status = sender_.bindThread();
+    if (!bind_status.ok()) {
+        LOG(ERROR) << "Failed to bind PXN sender thread: "
+                   << bind_status.ToString();
+    }
     while (running_.load(std::memory_order_acquire)) {
         bool made_progress = false;
         bool progress = false;
         (void)sender_.reapOutbound(progress);
         made_progress = made_progress || progress;
+        (void)sender_.progressOutbound(progress);
+        made_progress = made_progress || progress;
+
+        if (!made_progress && !sender_.hasInflight()) {
+            std::unique_lock<std::mutex> lock(sender_mutex_);
+            sender_condition_.wait_for(lock, std::chrono::microseconds(50));
+        }
+    }
+}
+
+void PxnPump::runRelay() {
+    while (running_.load(std::memory_order_acquire)) {
+        bool made_progress = false;
+        bool progress = false;
         (void)relay_.reapInbound(progress);
         made_progress = made_progress || progress;
         (void)relay_.progressInbound(progress);
         made_progress = made_progress || progress;
-        (void)sender_.progressOutbound(progress);
-        made_progress = made_progress || progress;
 
-        if (!made_progress) {
-            std::unique_lock<std::mutex> lock(mutex_);
-            condition_.wait_for(lock, std::chrono::microseconds(50));
+        if (!made_progress && !relay_.hasInflight()) {
+            std::unique_lock<std::mutex> lock(relay_mutex_);
+            relay_condition_.wait_for(lock, std::chrono::microseconds(50));
         }
     }
 }

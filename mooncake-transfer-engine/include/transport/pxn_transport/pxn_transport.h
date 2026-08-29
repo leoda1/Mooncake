@@ -236,6 +236,7 @@ class SenderBackend {
    public:
     virtual ~SenderBackend() = default;
 
+    virtual Status bindThread() { return Status::OK(); }
     virtual Status createLane(const SenderLaneEndpoint& endpoint,
                               std::unique_ptr<SenderLaneHandle>& handle) = 0;
     virtual Status recordReady(std::unique_ptr<SenderReadyFence>& fence) = 0;
@@ -310,6 +311,7 @@ class SenderLane {
     Status startFallback(QueuedSubmission submission);
     Status progressFallbackQueue(bool& made_progress);
     Status pollFallbacks(bool& made_progress);
+    Status progressOne(bool& made_progress);
     Status publish(QueuedSubmission submission, uint64_t sequence,
                    SenderPublishState& state, bool& quarantine_lane);
     void finishPublication(QueuedSubmission submission, uint64_t sequence,
@@ -347,8 +349,10 @@ class SenderPipeline {
     SenderPipeline& operator=(const SenderPipeline&) = delete;
 
     Status addPeer(PeerResources& peer, SenderLane*& lane);
+    Status bindThread();
     Status reapOutbound(bool& made_progress);
     Status progressOutbound(bool& made_progress);
+    bool hasInflight() const { return has_inflight_; }
     Status shutdown();
 
     // Sum of every lane's fallback byte counter.
@@ -368,6 +372,7 @@ class SenderPipeline {
     std::vector<std::unique_ptr<SenderLane>> lanes_;
     std::vector<PeerLaneEntry> peer_lanes_;
     size_t next_lane_ = 0;
+    bool has_inflight_ = false;
     bool shutdown_ = false;
 };
 
@@ -401,11 +406,27 @@ class RelayPipeline {
 
     Status reapInbound(bool& made_progress);
     Status progressInbound(bool& made_progress);
+    bool hasInflight() const { return inflight_count_ != 0; }
     void shutdown();
 
-    // Bytes successfully forwarded by the relay's second hop.
+    // Cumulative counters for each relay pipeline boundary.
+    uint64_t readyBytes() const {
+        return ready_bytes_.load(std::memory_order_relaxed);
+    }
+    uint64_t submittedBytes() const {
+        return submitted_bytes_.load(std::memory_order_relaxed);
+    }
     uint64_t relayedBytes() const {
         return relayed_bytes_.load(std::memory_order_relaxed);
+    }
+    uint64_t readyPieces() const {
+        return ready_pieces_.load(std::memory_order_relaxed);
+    }
+    uint64_t submittedPieces() const {
+        return submitted_pieces_.load(std::memory_order_relaxed);
+    }
+    uint64_t relayedPieces() const {
+        return relayed_pieces_.load(std::memory_order_relaxed);
     }
 
    private:
@@ -414,6 +435,7 @@ class RelayPipeline {
         std::unique_ptr<RelayTransfer> transfer;
     };
 
+    Status progressInboundOne(bool& made_progress);
     void complete(size_t lane_index, uint64_t sequence, int32_t status);
 
     ControlBlock* control_;
@@ -424,7 +446,12 @@ class RelayPipeline {
     std::array<uint64_t, kLaneCount> next_sequence_{};
     std::array<uint64_t, kLaneCount> lane_sender_epoch_{};
     std::array<std::deque<Inflight>, kLaneCount> inflight_;
+    std::atomic<uint64_t> ready_bytes_{0};
+    std::atomic<uint64_t> submitted_bytes_{0};
     std::atomic<uint64_t> relayed_bytes_{0};
+    std::atomic<uint64_t> ready_pieces_{0};
+    std::atomic<uint64_t> submitted_pieces_{0};
+    std::atomic<uint64_t> relayed_pieces_{0};
     size_t inflight_count_ = 0;
     size_t next_lane_ = 0;
 };
@@ -438,14 +465,18 @@ class PxnPump {
     void shutdown();
 
    private:
-    void run();
+    void runSender();
+    void runRelay();
 
     SenderPipeline& sender_;
     RelayPipeline& relay_;
     std::atomic<bool> running_{true};
-    std::mutex mutex_;
-    std::condition_variable condition_;
-    std::thread thread_;
+    std::mutex sender_mutex_;
+    std::mutex relay_mutex_;
+    std::condition_variable sender_condition_;
+    std::condition_variable relay_condition_;
+    std::thread sender_thread_;
+    std::thread relay_thread_;
 };
 
 std::unique_ptr<StagingBackend> makeCudaRdmaStagingBackend(
