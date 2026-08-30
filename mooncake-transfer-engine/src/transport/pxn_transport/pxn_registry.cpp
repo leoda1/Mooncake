@@ -432,6 +432,7 @@ void clearLane(LaneControl& lane) {
     lane.header.doorbell = 0;
     lane.header.completed = 0;
     lane.header.padding = 0;
+    std::memset(lane.progress, 0, sizeof(lane.progress));
     std::memset(lane.descriptors, 0, sizeof(lane.descriptors));
     std::memset(lane.completions, 0, sizeof(lane.completions));
     __atomic_store_n(&lane.header.state,
