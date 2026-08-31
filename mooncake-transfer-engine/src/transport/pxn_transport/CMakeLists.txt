@@ -12,5 +12,11 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
       pxn_transport PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
     target_link_libraries(pxn_transport PRIVATE CUDA::cuda_driver
                                                 CUDA::cudart)
+
+    option(PXN_ENABLE_NVTX "Emit NVTX ranges from the PXN transport" OFF)
+    if(PXN_ENABLE_NVTX)
+      target_compile_definitions(pxn_transport PRIVATE PXN_ENABLE_NVTX)
+      message(STATUS "PXN NVTX ranges enabled")
+    endif()
   endif()
 endif()

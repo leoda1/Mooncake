@@ -28,6 +28,7 @@
 
 #include "config.h"
 #include "memory_location.h"
+#include "transport/pxn_transport/pxn_nvtx.h"
 #include "transport/pxn_transport/pxn_transport.h"
 #include "transport/rdma_transport/rdma_context.h"
 
@@ -240,6 +241,7 @@ int PxnRdmaTransport::install(std::string& local_server_name,
 
 Status PxnRdmaTransport::submitTransferTask(
     const std::vector<TransferTask*>& task_list) {
+    PXN_NVTX_SENDER("pxn::submitTransferTask");
     if (!pxnReady()) return RdmaTransport::submitTransferTask(task_list);
 
     struct Group {
@@ -630,42 +632,8 @@ void PxnRdmaTransport::reportPxnStats() {
         << " | route_cache: hit=" << pxn_stats_.route_cache_hit.load()
         << " miss=" << pxn_stats_.route_cache_miss.load();
 
-    const auto lanes = relay_pipeline_->laneSlotStats();
-    const auto inflight = relay_pipeline_->inflightStats();
-    std::string empty;
-    std::string cuda_pending;
-    std::string rdma_pending;
-    size_t total_empty = 0;
-    for (size_t index = 0; index < lanes.size(); ++index) {
-        const auto& lane = lanes[index];
-        if (!empty.empty()) {
-            empty += ',';
-            cuda_pending += ',';
-            rdma_pending += ',';
-        }
-        const std::string label = "lane" + std::to_string(index) + ':';
-        empty += label;
-        cuda_pending += label;
-        rdma_pending += label;
-        if (!lane.active) {
-            empty += '-';
-            cuda_pending += '-';
-            rdma_pending += '-';
-            continue;
-        }
-        empty += std::to_string(lane.empty);
-        cuda_pending += std::to_string(lane.cuda_pending);
-        rdma_pending += std::to_string(lane.rdma_pending);
-        total_empty += lane.empty;
-    }
-    LOG(INFO) << "PXN slots: empty=[" << empty
-              << "] total_empty=" << total_empty << " cuda_pending=["
-              << cuda_pending << "] rdma_pending=[" << rdma_pending
-              << "] relay_inflight=" << inflight.current
-              << " relay_inflight_limit=" << inflight.limit
-              << " relay_inflight_hwm=" << inflight.high_watermark
-              << " relay_limit_blocked_pieces="
-              << inflight.limit_blocked_pieces;
+    LOG(INFO) << "PXN pipeline: fallback_bytes="
+              << sender_pipeline_->fallbackBytes();
 }
 
 }  // namespace mooncake

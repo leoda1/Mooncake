@@ -25,6 +25,8 @@
 #include <utility>
 #include <vector>
 
+#include "transport/pxn_transport/pxn_nvtx.h"
+
 #include "transport/rdma_transport/rdma_transport.h"
 
 namespace mooncake {
@@ -377,6 +379,7 @@ class CudaSenderBackend final : public SenderBackend {
     Status publish(SenderLaneHandle& handle, const SenderReadyFence& fence,
                    const std::vector<SenderCopy>& copies, uint64_t sequence,
                    SenderPublishState& state) override {
+        PXN_NVTX_SENDER("pxn::sender::publish");
         auto* lane = dynamic_cast<CudaSenderLaneHandle*>(&handle);
         auto* ready = dynamic_cast<const CudaReadyFence*>(&fence);
         if (lane == nullptr || ready == nullptr || copies.empty()) {

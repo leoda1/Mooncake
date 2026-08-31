@@ -399,20 +399,6 @@ class RelayBackend {
 
 class RelayPipeline {
    public:
-    struct LaneSlotStats {
-        bool active = false;
-        size_t empty = kSlotsPerLane;
-        size_t cuda_pending = 0;
-        size_t rdma_pending = 0;
-    };
-
-    struct InflightStats {
-        size_t current = 0;
-        size_t limit = 0;
-        size_t high_watermark = 0;
-        uint64_t limit_blocked_pieces = 0;
-    };
-
     RelayPipeline(ControlBlock* control, uintptr_t arena_address,
                   uint64_t epoch, size_t max_inflight,
                   std::unique_ptr<RelayBackend> backend);
@@ -422,8 +408,6 @@ class RelayPipeline {
     Status progressInbound(bool& made_progress);
     bool hasInflight() const { return inflight_count_ != 0; }
     void shutdown();
-    std::array<LaneSlotStats, kLaneCount> laneSlotStats() const;
-    InflightStats inflightStats() const;
 
     // Cumulative counters for each relay pipeline boundary.
     uint64_t readyBytes() const {
@@ -469,11 +453,6 @@ class RelayPipeline {
     std::atomic<uint64_t> submitted_pieces_{0};
     std::atomic<uint64_t> relayed_pieces_{0};
     size_t inflight_count_ = 0;
-    // Monitoring only: peak concurrent relay submissions and pieces that were
-    // ready but blocked by the inflight limit, surfaced via inflightStats().
-    size_t inflight_high_watermark_ = 0;
-    uint64_t limit_blocked_pieces_ = 0;
-    std::array<uint64_t, kLaneCount> last_limit_blocked_sequence_{};
     size_t next_lane_ = 0;
 };
 

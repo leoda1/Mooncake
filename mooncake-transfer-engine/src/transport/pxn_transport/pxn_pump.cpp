@@ -24,6 +24,7 @@
 #include "common.h"
 #include "config.h"
 #include "error.h"
+#include "transport/pxn_transport/pxn_nvtx.h"
 #include "transport/rdma_transport/rdma_context.h"
 #include "transport/rdma_transport/rdma_transport.h"
 
@@ -149,6 +150,7 @@ class RdmaRelayBackend final : public RelayBackend {
 
     Status submit(const RelaySubmission& submission,
                   std::unique_ptr<RelayTransfer>& transfer) override {
+        PXN_NVTX_RELAY("pxn::relay::submit");
         if (submission.rail_index >= source_rails_.size()) {
             return Status::InvalidArgument("PXN relay rail index is invalid");
         }
@@ -474,20 +476,6 @@ Status RelayPipeline::progressInbound(bool& made_progress) {
 Status RelayPipeline::progressInboundOne(bool& made_progress) {
     made_progress = false;
     if (inflight_count_ >= max_inflight_) {
-        for (size_t lane_index = 0; lane_index < kLaneCount; ++lane_index) {
-            const auto& lane = control_->lanes[lane_index];
-            if (loadLaneState(lane.header) !=
-                static_cast<uint32_t>(LaneState::kReady)) {
-                continue;
-            }
-            const uint64_t sequence = next_sequence_[lane_index];
-            const uint64_t doorbell =
-                __atomic_load_n(&lane.header.doorbell, __ATOMIC_ACQUIRE);
-            if (sequence == 0 || doorbell < sequence) continue;
-            if (last_limit_blocked_sequence_[lane_index] == sequence) continue;
-            last_limit_blocked_sequence_[lane_index] = sequence;
-            ++limit_blocked_pieces_;
-        }
         return Status::OK();
     }
 
@@ -523,8 +511,6 @@ Status RelayPipeline::progressInboundOne(bool& made_progress) {
                 {sequence, std::make_unique<CompletedRelayTransfer>(
                                ERR_INVALID_ARGUMENT)});
             ++inflight_count_;
-            inflight_high_watermark_ =
-                std::max(inflight_high_watermark_, inflight_count_);
             (void)advanceSequence(sequence, next_sequence_[lane_index]);
             next_lane_ = (lane_index + 1) % kLaneCount;
             made_progress = true;
@@ -554,8 +540,6 @@ Status RelayPipeline::progressInboundOne(bool& made_progress) {
         }
         inflight_[lane_index].push_back({sequence, std::move(transfer)});
         ++inflight_count_;
-        inflight_high_watermark_ =
-            std::max(inflight_high_watermark_, inflight_count_);
         (void)advanceSequence(sequence, next_sequence_[lane_index]);
         next_lane_ = (lane_index + 1) % kLaneCount;
         made_progress = true;
@@ -573,40 +557,6 @@ void RelayPipeline::shutdown() {
         queue.clear();
     }
     inflight_count_ = 0;
-}
-
-RelayPipeline::InflightStats RelayPipeline::inflightStats() const {
-    return {inflight_count_, max_inflight_,
-            std::max(inflight_high_watermark_, inflight_count_),
-            limit_blocked_pieces_};
-}
-
-std::array<RelayPipeline::LaneSlotStats, kLaneCount>
-RelayPipeline::laneSlotStats() const {
-    std::array<LaneSlotStats, kLaneCount> result;
-    for (size_t index = 0; index < kLaneCount; ++index) {
-        const auto& header = control_->lanes[index].header;
-        auto& stats = result[index];
-        stats.active =
-            loadLaneState(header) == static_cast<uint32_t>(LaneState::kReady);
-        if (!stats.active) continue;
-
-        const uint64_t completed =
-            __atomic_load_n(&header.completed, __ATOMIC_ACQUIRE);
-        uint64_t doorbell = __atomic_load_n(&header.doorbell, __ATOMIC_ACQUIRE);
-        uint64_t head = __atomic_load_n(&header.head, __ATOMIC_ACQUIRE);
-        // Clamp against torn/lagging reads so the subtraction stays ordered:
-        // completed <= doorbell <= head.
-        doorbell = std::max(doorbell, completed);
-        head = std::max(head, doorbell);
-
-        const uint64_t occupied =
-            std::min<uint64_t>(head - completed, kSlotsPerLane);
-        stats.empty = kSlotsPerLane - occupied;
-        stats.cuda_pending = static_cast<size_t>(head - doorbell);
-        stats.rdma_pending = static_cast<size_t>(doorbell - completed);
-    }
-    return result;
 }
 
 void RelayPipeline::complete(size_t lane_index, uint64_t sequence,
@@ -641,6 +591,7 @@ void PxnPump::shutdown() {
 }
 
 void PxnPump::runSender() {
+    PXN_NVTX_NAME_THREAD("pxn-sender");
     auto bind_status = sender_.bindThread();
     if (!bind_status.ok()) {
         LOG(ERROR) << "Failed to bind PXN sender thread: "
@@ -649,9 +600,15 @@ void PxnPump::runSender() {
     while (running_.load(std::memory_order_acquire)) {
         bool made_progress = false;
         bool progress = false;
-        (void)sender_.reapOutbound(progress);
+        {
+            PXN_NVTX_SENDER("pxn::sender::reap");
+            (void)sender_.reapOutbound(progress);
+        }
         made_progress = made_progress || progress;
-        (void)sender_.progressOutbound(progress);
+        {
+            PXN_NVTX_SENDER("pxn::sender::progress");
+            (void)sender_.progressOutbound(progress);
+        }
         made_progress = made_progress || progress;
 
         if (!made_progress && !sender_.hasInflight()) {
@@ -662,12 +619,19 @@ void PxnPump::runSender() {
 }
 
 void PxnPump::runRelay() {
+    PXN_NVTX_NAME_THREAD("pxn-relay");
     while (running_.load(std::memory_order_acquire)) {
         bool made_progress = false;
         bool progress = false;
-        (void)relay_.reapInbound(progress);
+        {
+            PXN_NVTX_RELAY("pxn::relay::reap");
+            (void)relay_.reapInbound(progress);
+        }
         made_progress = made_progress || progress;
-        (void)relay_.progressInbound(progress);
+        {
+            PXN_NVTX_RELAY("pxn::relay::progress");
+            (void)relay_.progressInbound(progress);
+        }
         made_progress = made_progress || progress;
 
         if (!made_progress && !relay_.hasInflight()) {
