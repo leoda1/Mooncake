@@ -84,50 +84,6 @@ TEST(PxnPumpTest, RelaysDoorbellAndPublishesCompletion) {
     EXPECT_EQ(lane.header.completed, 1u);
 }
 
-TEST(PxnPumpTest, ReportsInflightLimitPressureOncePerPiece) {
-    auto control = std::make_unique<ControlBlock>();
-    for (size_t lane_index = 0; lane_index < 2; ++lane_index) {
-        auto& lane = control->lanes[lane_index];
-        __atomic_store_n(&lane.header.state,
-                         static_cast<uint32_t>(LaneState::kReady),
-                         __ATOMIC_RELEASE);
-
-        Piece piece;
-        piece.length = 64;
-        piece.spans.push_back({0, 0x20000000 + lane_index * 64, 64, 0});
-        ASSERT_TRUE(
-            prepareDescriptor(piece, "decode", 7, lane.descriptors[0]).ok());
-        ASSERT_TRUE(commitDescriptor(lane.descriptors[0], 1));
-        __atomic_store_n(&lane.header.doorbell, uint64_t{1}, __ATOMIC_RELEASE);
-    }
-
-    auto backend = std::make_unique<FakeRelayBackend>();
-    RelayPipeline relay(control.get(), 0x400000000ULL, 7, 1,
-                        std::move(backend));
-
-    bool progressed = false;
-    ASSERT_TRUE(relay.progressInbound(progressed).ok());
-    ASSERT_TRUE(progressed);
-    auto stats = relay.inflightStats();
-    EXPECT_EQ(stats.current, 1u);
-    EXPECT_EQ(stats.limit, 1u);
-    EXPECT_EQ(stats.high_watermark, 1u);
-    EXPECT_EQ(stats.limit_blocked_pieces, 1u);
-
-    ASSERT_TRUE(relay.progressInbound(progressed).ok());
-    EXPECT_FALSE(progressed);
-    EXPECT_EQ(relay.inflightStats().limit_blocked_pieces, 1u);
-
-    ASSERT_TRUE(relay.reapInbound(progressed).ok());
-    ASSERT_TRUE(progressed);
-    ASSERT_TRUE(relay.progressInbound(progressed).ok());
-    ASSERT_TRUE(progressed);
-    stats = relay.inflightStats();
-    EXPECT_EQ(stats.current, 1u);
-    EXPECT_EQ(stats.high_watermark, 1u);
-    EXPECT_EQ(stats.limit_blocked_pieces, 1u);
-}
-
 TEST(PxnPumpTest, CompletesSliceWithoutTransferTask) {
     struct Completion {
         size_t completed = 0;

@@ -31,6 +31,22 @@ namespace mooncake {
 namespace pxn {
 namespace {
 
+class CompletedRelayTransfer final : public RelayTransfer {
+   public:
+    explicit CompletedRelayTransfer(int32_t status) : status_(status) {}
+
+    Status poll(bool& completed, int32_t& completion_status) override {
+        completed = true;
+        completion_status = status_;
+        return Status::OK();
+    }
+
+    void abandon() override {}
+
+   private:
+    int32_t status_;
+};
+
 class RelaySlicePool {
    public:
     explicit RelaySlicePool(size_t capacity)
@@ -420,34 +436,22 @@ Status RelayPipeline::reapInbound(bool& made_progress) {
     for (size_t lane_index = 0; lane_index < kLaneCount; ++lane_index) {
         auto& queue = inflight_[lane_index];
         while (!queue.empty()) {
-            auto& item = queue.front();
-            for (auto iterator = item.transfers.begin();
-                 iterator != item.transfers.end();) {
-                bool completed = false;
-                int32_t completion_status = 0;
-                auto status = (*iterator)->poll(completed, completion_status);
-                if (!status.ok()) {
-                    (*iterator)->abandon();
-                    (void)iterator->release();
-                    iterator = item.transfers.erase(iterator);
-                    item.status = ERR_CONTEXT;
-                    if (first_error.ok()) first_error = status;
-                    made_progress = true;
-                    continue;
-                }
-                if (!completed) {
-                    ++iterator;
-                    continue;
-                }
-                if (completion_status != 0) item.status = completion_status;
-                iterator = item.transfers.erase(iterator);
-                made_progress = true;
+            bool completed = false;
+            int32_t completion_status = 0;
+            auto status =
+                queue.front().transfer->poll(completed, completion_status);
+            if (!status.ok()) {
+                queue.front().transfer->abandon();
+                (void)queue.front().transfer.release();
+                completed = true;
+                completion_status = ERR_CONTEXT;
+                if (first_error.ok()) first_error = status;
             }
-            if (!item.fully_submitted || !item.transfers.empty()) break;
+            if (!completed) break;
 
-            complete(lane_index, item.sequence, item.status);
+            complete(lane_index, queue.front().sequence, completion_status);
             queue.pop_front();
-            inflight_count_.fetch_sub(1, std::memory_order_relaxed);
+            --inflight_count_;
             made_progress = true;
         }
     }
@@ -457,7 +461,7 @@ Status RelayPipeline::reapInbound(bool& made_progress) {
 Status RelayPipeline::progressInbound(bool& made_progress) {
     made_progress = false;
     Status first_error;
-    while (true) {
+    while (inflight_count_ < max_inflight_) {
         bool progress = false;
         auto status = progressInboundOne(progress);
         if (first_error.ok() && !status.ok()) first_error = status;
@@ -469,6 +473,23 @@ Status RelayPipeline::progressInbound(bool& made_progress) {
 
 Status RelayPipeline::progressInboundOne(bool& made_progress) {
     made_progress = false;
+    if (inflight_count_ >= max_inflight_) {
+        for (size_t lane_index = 0; lane_index < kLaneCount; ++lane_index) {
+            const auto& lane = control_->lanes[lane_index];
+            if (loadLaneState(lane.header) !=
+                static_cast<uint32_t>(LaneState::kReady)) {
+                continue;
+            }
+            const uint64_t sequence = next_sequence_[lane_index];
+            const uint64_t doorbell =
+                __atomic_load_n(&lane.header.doorbell, __ATOMIC_ACQUIRE);
+            if (sequence == 0 || doorbell < sequence) continue;
+            if (last_limit_blocked_sequence_[lane_index] == sequence) continue;
+            last_limit_blocked_sequence_[lane_index] = sequence;
+            ++limit_blocked_pieces_;
+        }
+        return Status::OK();
+    }
 
     for (size_t offset = 0; offset < kLaneCount; ++offset) {
         const size_t lane_index = (next_lane_ + offset) % kLaneCount;
@@ -486,115 +507,56 @@ Status RelayPipeline::progressInboundOne(bool& made_progress) {
             }
             lane_sender_epoch_[lane_index] = sender_epoch;
             next_sequence_[lane_index] = 1;
-            last_limit_blocked_sequence_[lane_index] = 0;
         }
 
-        auto& queue = inflight_[lane_index];
-        Inflight* item = !queue.empty() && !queue.back().fully_submitted
-                             ? &queue.back()
-                             : nullptr;
-        const bool at_inflight_limit =
-            item == nullptr &&
-            inflight_count_.load(std::memory_order_relaxed) >= max_inflight_;
-
-        const uint64_t sequence =
-            item == nullptr ? next_sequence_[lane_index] : item->sequence;
-        const uint64_t head =
-            __atomic_load_n(&lane.header.head, __ATOMIC_ACQUIRE);
+        const uint64_t sequence = next_sequence_[lane_index];
         const uint64_t doorbell =
             __atomic_load_n(&lane.header.doorbell, __ATOMIC_ACQUIRE);
-        if (sequence == 0 || std::max(head, doorbell) < sequence) continue;
+        if (sequence == 0 || doorbell < sequence) continue;
 
         const size_t slot = *slotIndex(sequence);
-        if (item != nullptr && item->status != 0) {
-            if (doorbell < sequence) continue;
-            item->fully_submitted = true;
-            (void)advanceSequence(sequence, next_sequence_[lane_index]);
-            next_lane_ = (lane_index + 1) % kLaneCount;
-            made_progress = true;
-            return Status::OK();
-        }
-
         const auto& descriptor = lane.descriptors[slot];
         const auto descriptor_status =
             validateDescriptor(descriptor, sequence, epoch_);
         if (descriptor_status != DescriptorError::kOk) {
-            if (item == nullptr) {
-                if (at_inflight_limit) continue;
-                queue.push_back({sequence});
-                queue.back().status = ERR_INVALID_ARGUMENT;
-                addInflight();
-            } else {
-                item->status = ERR_INVALID_ARGUMENT;
-            }
+            inflight_[lane_index].push_back(
+                {sequence, std::make_unique<CompletedRelayTransfer>(
+                               ERR_INVALID_ARGUMENT)});
+            ++inflight_count_;
+            inflight_high_watermark_ =
+                std::max(inflight_high_watermark_, inflight_count_);
+            (void)advanceSequence(sequence, next_sequence_[lane_index]);
             next_lane_ = (lane_index + 1) % kLaneCount;
             made_progress = true;
             return Status::OK();
         }
 
-        const uint64_t ready_step =
-            __atomic_load_n(&lane.progress[slot].ready_step, __ATOMIC_ACQUIRE);
-        const uint64_t final_step = readyStepCount(descriptor.piece_length);
-        const uint64_t ready_bytes =
-            doorbell >= sequence || ready_step >= final_step
-                ? descriptor.piece_length
-                : ready_step * static_cast<uint64_t>(kReadyStepSize);
-        if (item == nullptr) {
-            if (ready_bytes == 0) continue;
-            if (at_inflight_limit) {
-                if (last_limit_blocked_sequence_[lane_index] != sequence) {
-                    last_limit_blocked_sequence_[lane_index] = sequence;
-                    limit_blocked_pieces_.fetch_add(1,
-                                                    std::memory_order_relaxed);
-                }
-                continue;
-            }
-            queue.push_back({sequence});
-            item = &queue.back();
-            addInflight();
-        }
-        if (ready_bytes <= item->submitted_bytes) continue;
-
-        const uint64_t begin = item->submitted_bytes;
-        const uint64_t end = std::min<uint64_t>(
-            ready_bytes, begin + static_cast<uint64_t>(kReadyStepSize));
         RelaySubmission submission;
-        submission.source = arena_address_ +
-                            (lane_index * kSlotsPerLane + slot) * kSlotSize +
-                            begin;
+        submission.source =
+            arena_address_ + (lane_index * kSlotsPerLane + slot) * kSlotSize;
         submission.session.assign(descriptor.session,
                                   descriptor.session_length);
         submission.rail_index = descriptor.rail_index;
-        uint64_t next_plan_begin = item->plan_begin;
-        size_t next_plan_index = item->plan_index;
-        for (; next_plan_index < descriptor.plan_count; ++next_plan_index) {
-            const auto& plan = descriptor.plans[next_plan_index];
-            const uint64_t plan_end = next_plan_begin + plan.length;
-            const uint64_t overlap_begin = std::max(begin, next_plan_begin);
-            const uint64_t overlap_end = std::min(end, plan_end);
-            if (overlap_begin < overlap_end) {
-                submission.plans.push_back(
-                    {plan.final_destination + overlap_begin - next_plan_begin,
-                     overlap_end - overlap_begin});
-            }
-            if (plan_end > end) break;
-            next_plan_begin = plan_end;
-        }
+        submission.plans.assign(descriptor.plans,
+                                descriptor.plans + descriptor.plan_count);
+        ready_bytes_.fetch_add(descriptor.piece_length,
+                               std::memory_order_relaxed);
+        ready_pieces_.fetch_add(1, std::memory_order_relaxed);
 
         std::unique_ptr<RelayTransfer> transfer;
         auto status = backend_->submit(submission, transfer);
         if (!status.ok()) {
-            item->status = ERR_CONTEXT;
+            transfer = std::make_unique<CompletedRelayTransfer>(ERR_CONTEXT);
         } else {
-            item->submitted_bytes = end;
-            item->plan_begin = next_plan_begin;
-            item->plan_index = next_plan_index;
-            item->fully_submitted = end == descriptor.piece_length;
-            item->transfers.push_back(std::move(transfer));
+            submitted_bytes_.fetch_add(descriptor.piece_length,
+                                       std::memory_order_relaxed);
+            submitted_pieces_.fetch_add(1, std::memory_order_relaxed);
         }
-        if (item->fully_submitted) {
-            (void)advanceSequence(sequence, next_sequence_[lane_index]);
-        }
+        inflight_[lane_index].push_back({sequence, std::move(transfer)});
+        ++inflight_count_;
+        inflight_high_watermark_ =
+            std::max(inflight_high_watermark_, inflight_count_);
+        (void)advanceSequence(sequence, next_sequence_[lane_index]);
         next_lane_ = (lane_index + 1) % kLaneCount;
         made_progress = true;
         return status;
@@ -605,33 +567,18 @@ Status RelayPipeline::progressInboundOne(bool& made_progress) {
 void RelayPipeline::shutdown() {
     for (auto& queue : inflight_) {
         for (auto& item : queue) {
-            for (auto& transfer : item.transfers) {
-                transfer->abandon();
-                (void)transfer.release();
-            }
+            item.transfer->abandon();
+            (void)item.transfer.release();
         }
         queue.clear();
     }
-    inflight_count_.store(0, std::memory_order_relaxed);
+    inflight_count_ = 0;
 }
 
 RelayPipeline::InflightStats RelayPipeline::inflightStats() const {
-    const size_t current = inflight_count_.load(std::memory_order_relaxed);
-    const size_t high_watermark = std::max(
-        current, inflight_high_watermark_.load(std::memory_order_relaxed));
-    return {current, max_inflight_, high_watermark,
-            limit_blocked_pieces_.load(std::memory_order_relaxed)};
-}
-
-void RelayPipeline::addInflight() {
-    const size_t current =
-        inflight_count_.fetch_add(1, std::memory_order_relaxed) + 1;
-    size_t high_watermark =
-        inflight_high_watermark_.load(std::memory_order_relaxed);
-    while (high_watermark < current &&
-           !inflight_high_watermark_.compare_exchange_weak(
-               high_watermark, current, std::memory_order_relaxed)) {
-    }
+    return {inflight_count_, max_inflight_,
+            std::max(inflight_high_watermark_, inflight_count_),
+            limit_blocked_pieces_};
 }
 
 std::array<RelayPipeline::LaneSlotStats, kLaneCount>
@@ -648,6 +595,8 @@ RelayPipeline::laneSlotStats() const {
             __atomic_load_n(&header.completed, __ATOMIC_ACQUIRE);
         uint64_t doorbell = __atomic_load_n(&header.doorbell, __ATOMIC_ACQUIRE);
         uint64_t head = __atomic_load_n(&header.head, __ATOMIC_ACQUIRE);
+        // Clamp against torn/lagging reads so the subtraction stays ordered:
+        // completed <= doorbell <= head.
         doorbell = std::max(doorbell, completed);
         head = std::max(head, doorbell);
 
@@ -667,6 +616,7 @@ void RelayPipeline::complete(size_t lane_index, uint64_t sequence,
     if (status == 0) {
         relayed_bytes_.fetch_add(lane.descriptors[slot].piece_length,
                                  std::memory_order_relaxed);
+        relayed_pieces_.fetch_add(1, std::memory_order_relaxed);
     }
     (void)commitCompletion(lane.completions[slot], sequence, status);
     __atomic_store_n(&lane.header.completed, sequence, __ATOMIC_RELEASE);

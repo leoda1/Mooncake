@@ -420,31 +420,38 @@ class RelayPipeline {
 
     Status reapInbound(bool& made_progress);
     Status progressInbound(bool& made_progress);
-    bool hasInflight() const {
-        return inflight_count_.load(std::memory_order_relaxed) != 0;
-    }
+    bool hasInflight() const { return inflight_count_ != 0; }
     void shutdown();
     std::array<LaneSlotStats, kLaneCount> laneSlotStats() const;
     InflightStats inflightStats() const;
 
-    // Bytes successfully forwarded by the relay's second hop.
+    // Cumulative counters for each relay pipeline boundary.
+    uint64_t readyBytes() const {
+        return ready_bytes_.load(std::memory_order_relaxed);
+    }
+    uint64_t submittedBytes() const {
+        return submitted_bytes_.load(std::memory_order_relaxed);
+    }
     uint64_t relayedBytes() const {
         return relayed_bytes_.load(std::memory_order_relaxed);
+    }
+    uint64_t readyPieces() const {
+        return ready_pieces_.load(std::memory_order_relaxed);
+    }
+    uint64_t submittedPieces() const {
+        return submitted_pieces_.load(std::memory_order_relaxed);
+    }
+    uint64_t relayedPieces() const {
+        return relayed_pieces_.load(std::memory_order_relaxed);
     }
 
    private:
     struct Inflight {
         uint64_t sequence;
-        uint64_t submitted_bytes = 0;
-        uint64_t plan_begin = 0;
-        size_t plan_index = 0;
-        int32_t status = 0;
-        bool fully_submitted = false;
-        std::deque<std::unique_ptr<RelayTransfer>> transfers;
+        std::unique_ptr<RelayTransfer> transfer;
     };
 
     Status progressInboundOne(bool& made_progress);
-    void addInflight();
     void complete(size_t lane_index, uint64_t sequence, int32_t status);
 
     ControlBlock* control_;
@@ -455,10 +462,17 @@ class RelayPipeline {
     std::array<uint64_t, kLaneCount> next_sequence_{};
     std::array<uint64_t, kLaneCount> lane_sender_epoch_{};
     std::array<std::deque<Inflight>, kLaneCount> inflight_;
+    std::atomic<uint64_t> ready_bytes_{0};
+    std::atomic<uint64_t> submitted_bytes_{0};
     std::atomic<uint64_t> relayed_bytes_{0};
-    std::atomic<size_t> inflight_count_{0};
-    std::atomic<size_t> inflight_high_watermark_{0};
-    std::atomic<uint64_t> limit_blocked_pieces_{0};
+    std::atomic<uint64_t> ready_pieces_{0};
+    std::atomic<uint64_t> submitted_pieces_{0};
+    std::atomic<uint64_t> relayed_pieces_{0};
+    size_t inflight_count_ = 0;
+    // Monitoring only: peak concurrent relay submissions and pieces that were
+    // ready but blocked by the inflight limit, surfaced via inflightStats().
+    size_t inflight_high_watermark_ = 0;
+    uint64_t limit_blocked_pieces_ = 0;
     std::array<uint64_t, kLaneCount> last_limit_blocked_sequence_{};
     size_t next_lane_ = 0;
 };

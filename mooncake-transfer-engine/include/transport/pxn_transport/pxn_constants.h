@@ -16,7 +16,6 @@
 #define MOONCAKE_TRANSFER_ENGINE_PXN_CONSTANTS_H_
 
 #include <cstddef>
-#include <cstdint>
 
 namespace mooncake {
 namespace pxn {
@@ -24,7 +23,6 @@ namespace pxn {
 inline constexpr size_t kLaneCount = 7;
 inline constexpr size_t kSlotsPerLane = 18;
 inline constexpr size_t kSlotSize = 8ULL * 1024 * 1024;
-inline constexpr size_t kReadyStepSize = 1ULL * 1024 * 1024;
 inline constexpr size_t kRequiredArenaSize =
     kLaneCount * kSlotsPerLane * kSlotSize;
 inline constexpr size_t kMaxPlanCount = 4096;
@@ -32,11 +30,6 @@ inline constexpr size_t kMaxSessionLength = 256;
 inline constexpr size_t kMaxRailsPerRank = 16;
 
 static_assert(kRequiredArenaSize == 1008ULL * 1024 * 1024);
-static_assert(kSlotSize % kReadyStepSize == 0);
-
-inline constexpr uint64_t readyStepCount(uint64_t length) {
-    return (length + kReadyStepSize - 1) / kReadyStepSize;
-}
 
 }  // namespace pxn
 }  // namespace mooncake

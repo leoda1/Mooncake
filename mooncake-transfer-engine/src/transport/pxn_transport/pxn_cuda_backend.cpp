@@ -18,8 +18,6 @@
 #include <cuda_runtime.h>
 #include <glog/logging.h>
 
-#include <algorithm>
-#include <array>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -259,7 +257,6 @@ class CudaSenderLaneHandle final : public SenderLaneHandle {
     cudaStream_t stream_ = nullptr;
     cudaEvent_t publish_event_ = nullptr;
     CUdeviceptr device_doorbell_ = 0;
-    std::array<CUdeviceptr, kSlotsPerLane> device_ready_steps_{};
     bool stream_mem_ops_ = false;
 };
 
@@ -303,15 +300,6 @@ class CudaSenderBackend final : public SenderBackend {
         candidate->device_doorbell_ =
             reinterpret_cast<CUdeviceptr>(device_control) +
             static_cast<CUdeviceptr>(doorbell - control_base);
-        for (size_t slot = 0; slot < kSlotsPerLane; ++slot) {
-            const auto ready_step = reinterpret_cast<uintptr_t>(
-                &endpoint.control->lanes[endpoint.lane_index]
-                     .progress[slot]
-                     .ready_step);
-            candidate->device_ready_steps_[slot] =
-                reinterpret_cast<CUdeviceptr>(device_control) +
-                static_cast<CUdeviceptr>(ready_step - control_base);
-        }
 
         error = cudaStreamCreateWithFlags(&candidate->stream_,
                                           cudaStreamNonBlocking);
@@ -405,54 +393,48 @@ class CudaSenderBackend final : public SenderBackend {
             }
         }
 
-        const auto slot = slotIndex(sequence);
-        if (!slot.has_value()) {
-            return Status::InvalidArgument("invalid PXN CUDA sequence");
-        }
-        size_t total_length = 0;
+        std::vector<void*> sources;
+        std::vector<void*> destinations;
+        std::vector<size_t> sizes;
+        sources.reserve(copies.size());
+        destinations.reserve(copies.size());
+        sizes.reserve(copies.size());
         for (const auto& copy : copies) {
-            if (copy.length == 0 || copy.length > kSlotSize - total_length) {
-                return Status::InvalidArgument("invalid PXN CUDA copy size");
-            }
-            total_length += copy.length;
+            sources.push_back(reinterpret_cast<void*>(copy.source));
+            destinations.push_back(reinterpret_cast<void*>(copy.destination));
+            sizes.push_back(copy.length);
         }
 
-        size_t copied = 0;
-        size_t next_step_end = std::min(kReadyStepSize, total_length);
-        uint64_t ready_step = 0;
-        for (const auto& copy : copies) {
-            size_t copy_offset = 0;
-            while (copy_offset < copy.length) {
-                const size_t length =
-                    std::min(copy.length - copy_offset, next_step_end - copied);
-                error = cudaMemcpyAsync(
-                    reinterpret_cast<void*>(copy.destination + copy_offset),
-                    reinterpret_cast<const void*>(copy.source + copy_offset),
-                    length, cudaMemcpyDefault, lane->stream_);
-                if (error != cudaSuccess) {
-                    return cudaError("cudaMemcpyAsync failed", error);
-                }
-                copy_offset += length;
-                copied += length;
-                if (copied != next_step_end) continue;
-
-                ++ready_step;
-                if (lane->stream_mem_ops_) {
-                    auto result = cuStreamWriteValue64(
-                        reinterpret_cast<CUstream>(lane->stream_),
-                        lane->device_ready_steps_[*slot], ready_step,
-                        CU_STREAM_WRITE_VALUE_DEFAULT);
-                    if (result != CUDA_SUCCESS) {
-                        return driverError("cuStreamWriteValue64 step failed",
-                                           result);
-                    }
-                }
-                if (copied < total_length) {
-                    next_step_end =
-                        std::min(total_length, copied + kReadyStepSize);
-                }
+#if CUDART_VERSION >= 12080
+        cudaMemcpyAttributes attributes{};
+        attributes.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+        size_t attribute_index = 0;
+        std::vector<size_t> mutable_sizes(sizes);
+#if CUDART_VERSION >= 13000
+        error = cudaMemcpyBatchAsync(
+            const_cast<const void**>(destinations.data()),
+            const_cast<const void**>(sources.data()), mutable_sizes.data(),
+            copies.size(), &attributes, &attribute_index, 1, lane->stream_);
+#else
+        size_t failed_index = copies.size();
+        error = cudaMemcpyBatchAsync(destinations.data(), sources.data(),
+                                     mutable_sizes.data(), copies.size(),
+                                     &attributes, &attribute_index, 1,
+                                     &failed_index, lane->stream_);
+#endif
+        if (error != cudaSuccess) {
+            return cudaError("cudaMemcpyBatchAsync failed", error);
+        }
+#else
+        for (size_t index = 0; index < copies.size(); ++index) {
+            error =
+                cudaMemcpyAsync(destinations[index], sources[index],
+                                sizes[index], cudaMemcpyDefault, lane->stream_);
+            if (error != cudaSuccess) {
+                return cudaError("cudaMemcpyAsync failed", error);
             }
         }
+#endif
 
         if (lane->stream_mem_ops_) {
             auto result =

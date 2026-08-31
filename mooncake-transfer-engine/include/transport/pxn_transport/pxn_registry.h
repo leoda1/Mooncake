@@ -34,7 +34,7 @@ namespace mooncake {
 namespace pxn {
 
 inline constexpr uint64_t kRegistryMagic = 0x4D4350584E524547ULL;
-inline constexpr uint32_t kRegistryAbiVersion = 3;
+inline constexpr uint32_t kRegistryAbiVersion = 2;
 inline constexpr size_t kMaxRailNameLength = 256;
 inline constexpr size_t kCudaIpcHandleSize = 64;
 
@@ -96,14 +96,8 @@ struct alignas(64) LaneHeader {
     uint64_t padding;
 };
 
-struct alignas(64) SlotProgress {
-    uint64_t ready_step;
-    uint8_t padding[56];
-};
-
 struct alignas(64) LaneControl {
     LaneHeader header;
-    SlotProgress progress[kSlotsPerLane];
     Descriptor descriptors[kSlotsPerLane];
     Completion completions[kSlotsPerLane];
 };
@@ -128,14 +122,10 @@ static_assert(alignof(LaneHeader) == 64);
 static_assert(offsetof(LaneHeader, sender) == 8);
 static_assert(offsetof(LaneHeader, sender_epoch) == 24);
 static_assert(sizeof(LaneHeader) == 64);
-static_assert(sizeof(SlotProgress) == 64);
-static_assert(alignof(SlotProgress) == 64);
-static_assert(std::is_standard_layout_v<SlotProgress>);
-static_assert(std::is_trivially_copyable_v<SlotProgress>);
 static_assert(alignof(LaneControl) == 64);
-static_assert(sizeof(LaneControl) == 1187776);
+static_assert(sizeof(LaneControl) == 1186624);
 static_assert(alignof(ControlBlock) == 64);
-static_assert(sizeof(ControlBlock) == 8314880);
+static_assert(sizeof(ControlBlock) == 8306816);
 static_assert(std::is_standard_layout_v<RegistryHeader>);
 static_assert(std::is_trivially_copyable_v<RegistryHeader>);
 static_assert(std::is_standard_layout_v<LaneHeader>);

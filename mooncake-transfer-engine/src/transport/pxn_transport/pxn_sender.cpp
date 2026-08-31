@@ -406,8 +406,6 @@ Status SenderLane::publish(QueuedSubmission submission, uint64_t sequence,
                           static_cast<size_t>(span.length)});
         destination += static_cast<size_t>(span.length);
     }
-    __atomic_store_n(&lane.progress[*slot].ready_step, uint64_t{0},
-                     __ATOMIC_RELEASE);
     if (!commitDescriptor(lane.descriptors[*slot], sequence)) {
         quarantine_lane = true;
         auto fallback_status = deferOrStartFallback(std::move(submission));
@@ -435,16 +433,9 @@ Status SenderLane::publish(QueuedSubmission submission, uint64_t sequence,
 
 void SenderLane::finishPublication(QueuedSubmission submission,
                                    uint64_t sequence, bool cpu_doorbell) {
-    auto& lane = endpoint_.control->lanes[endpoint_.lane_index];
-    auto& header = lane.header;
+    auto& header = endpoint_.control->lanes[endpoint_.lane_index].header;
     __atomic_store_n(&header.head, sequence, __ATOMIC_RELEASE);
     if (cpu_doorbell) {
-        const auto slot = slotIndex(sequence);
-        if (slot.has_value()) {
-            __atomic_store_n(&lane.progress[*slot].ready_step,
-                             readyStepCount(submission.submission.piece.length),
-                             __ATOMIC_RELEASE);
-        }
         __atomic_store_n(&header.doorbell, sequence, __ATOMIC_RELEASE);
     }
     markPosted(submission.submission.slices);

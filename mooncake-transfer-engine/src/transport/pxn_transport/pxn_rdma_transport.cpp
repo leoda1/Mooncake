@@ -380,8 +380,22 @@ Status PxnRdmaTransport::submitTransferTask(
         result = RdmaTransport::submitTransferTask(direct_tasks);
     }
     for (auto& item : pending) {
+        const uint64_t bytes = item.submission.piece.length;
+        const uint64_t source_spans = item.submission.piece.spans.size();
         auto status = item.lane->enqueue(std::move(item.submission));
         if (result.ok() && !status.ok()) result = status;
+        if (!status.ok()) continue;
+        add_stat(pxn_stats_.enqueued_bytes, bytes);
+        add_stat(pxn_stats_.enqueued_pieces, 1);
+        add_stat(pxn_stats_.source_spans, source_spans);
+        auto update_max = [](std::atomic<uint64_t>& counter, uint64_t value) {
+            uint64_t current = counter.load(std::memory_order_relaxed);
+            while (current < value &&
+                   !counter.compare_exchange_weak(current, value,
+                                                  std::memory_order_relaxed)) {
+            }
+        };
+        update_max(pxn_stats_.max_source_spans, source_spans);
     }
     if (!pending.empty()) pump_->wake();
     reportPxnStats();
@@ -589,6 +603,33 @@ bool PxnRdmaTransport::selectPxnLane(const TransferRequest& request,
 void PxnRdmaTransport::reportPxnStats() {
     const uint64_t n = pxn_stats_.reported.fetch_add(1) + 1;
     if (n % 200 != 0) return;
+    const uint64_t enqueued_pieces = pxn_stats_.enqueued_pieces.load();
+    const uint64_t source_spans = pxn_stats_.source_spans.load();
+    LOG(INFO)
+        << "PXN stats: used=" << pxn_stats_.pxn_used.load()
+        << " pxn_bytes=" << pxn_stats_.pxn_bytes.load()
+        << " direct_bytes=" << pxn_stats_.direct_bytes.load()
+        << " | pipeline: tx_enqueued_bytes=" << pxn_stats_.enqueued_bytes.load()
+        << " tx_pieces=" << enqueued_pieces
+        << " relay_ready_bytes=" << relay_pipeline_->readyBytes()
+        << " relay_ready_pieces=" << relay_pipeline_->readyPieces()
+        << " relay_submitted_bytes=" << relay_pipeline_->submittedBytes()
+        << " relay_submitted_pieces=" << relay_pipeline_->submittedPieces()
+        << " relay_completed_bytes=" << relay_pipeline_->relayedBytes()
+        << " relay_completed_pieces=" << relay_pipeline_->relayedPieces()
+        << " | shape: copy_spans_total=" << source_spans
+        << " copy_spans_avg_x100="
+        << (enqueued_pieces == 0 ? 0 : source_spans * 100 / enqueued_pieces)
+        << " copy_spans_max=" << pxn_stats_.max_source_spans.load()
+        << " | skipped: same_rail=" << pxn_stats_.same_rail.load()
+        << " no_relay=" << pxn_stats_.no_relay.load()
+        << " not_cuda=" << pxn_stats_.not_cuda.load()
+        << " no_device=" << pxn_stats_.no_device.load()
+        << " no_target=" << pxn_stats_.no_target.load()
+        << " not_write=" << pxn_stats_.not_write.load()
+        << " | route_cache: hit=" << pxn_stats_.route_cache_hit.load()
+        << " miss=" << pxn_stats_.route_cache_miss.load();
+
     const auto lanes = relay_pipeline_->laneSlotStats();
     const auto inflight = relay_pipeline_->inflightStats();
     std::string empty;

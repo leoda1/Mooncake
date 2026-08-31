@@ -80,6 +80,10 @@ class PxnRdmaTransport : public RdmaTransport {
         std::atomic<uint64_t> pxn_used{0};   // took the PXN path
         std::atomic<uint64_t> pxn_bytes{0};
         std::atomic<uint64_t> direct_bytes{0};
+        std::atomic<uint64_t> enqueued_bytes{0};
+        std::atomic<uint64_t> enqueued_pieces{0};
+        std::atomic<uint64_t> source_spans{0};
+        std::atomic<uint64_t> max_source_spans{0};
         std::atomic<uint64_t> route_cache_hit{0};
         std::atomic<uint64_t> route_cache_miss{0};
         std::atomic<uint64_t> reported{0};
