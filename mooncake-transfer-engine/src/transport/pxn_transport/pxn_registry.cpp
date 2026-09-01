@@ -34,6 +34,8 @@
 #include <unistd.h>
 #include <utility>
 
+#include "config.h"
+
 #if defined(__linux__)
 #include <linux/fs.h>
 #include <sys/random.h>
@@ -175,16 +177,22 @@ Status decodeRails(const RegistryHeader& header,
 }
 
 Status validateRegistryHeader(const RegistryHeader& header) {
+    const auto& config = globalConfig();
+    const PxnGeometry geometry{config.pxn_lane_count, config.pxn_slots_per_lane,
+                               config.pxn_slot_size};
+    if (!geometry.valid()) {
+        return Status::InvalidArgument("incompatible PXN registry entry");
+    }
     if (header.magic != kRegistryMagic ||
         header.abi_version != kRegistryAbiVersion ||
         header.header_bytes != sizeof(RegistryHeader) ||
         header.mapping_bytes != sizeof(ControlBlock) ||
         header.owner.uid != geteuid() || header.owner.pid <= 0 ||
         header.owner.start_ticks == 0 || header.epoch == 0 ||
-        header.lane_count != kLaneCount ||
-        header.slots_per_lane != kSlotsPerLane ||
-        header.slot_size != kSlotSize ||
-        header.arena_size != kRequiredArenaSize ||
+        header.lane_count != config.pxn_lane_count ||
+        header.slots_per_lane != config.pxn_slots_per_lane ||
+        header.slot_size != config.pxn_slot_size ||
+        header.arena_size != geometry.arenaSize() ||
         header.ipc_handle_bytes != kCudaIpcHandleSize ||
         !std::all_of(std::begin(header.padding), std::end(header.padding),
                      [](uint8_t byte) { return byte == 0; })) {
@@ -609,8 +617,9 @@ Status RegistryRegistration::publish() {
             return Status::InvalidArgument("PXN process is already published");
         }
     }
-    if (entries.size() >= kLaneCount + 1) {
-        return Status::TooManyRequests("PXN group has more than eight ranks");
+    if (entries.size() >= control_->header.lane_count + 1) {
+        return Status::TooManyRequests(
+            "PXN group exceeds configured lane capacity");
     }
 
     __atomic_store_n(&control_->header.state,
@@ -677,7 +686,8 @@ Status RegistryRegistration::activeAttachments(size_t& count) {
     if (!status.ok()) return status;
 
     count = 0;
-    for (auto& lane : control_->lanes) {
+    for (size_t index = 0; index < control_->header.lane_count; ++index) {
+        auto& lane = control_->lanes[index];
         if (loadLaneState(lane.header) !=
                 static_cast<uint32_t>(LaneState::kReady) ||
             __atomic_load_n(&lane.header.arena_attached, __ATOMIC_ACQUIRE) ==
@@ -721,7 +731,7 @@ Status PeerMapping::claimLane(const ProcessIdentity& sender,
         return Status::InvalidArgument("PXN lane owner is not live");
     }
     std::lock_guard<std::mutex> local_lock(mutex_);
-    if (lane_index_ < kLaneCount &&
+    if (lane_index_ < control_->header.lane_count &&
         (sender_ != sender || sender_epoch_ != sender_epoch)) {
         return Status::InvalidArgument("PXN mapping already owns a lane");
     }
@@ -732,7 +742,7 @@ Status PeerMapping::claimLane(const ProcessIdentity& sender,
     if (!status.ok()) return status;
 
     std::optional<size_t> available;
-    for (size_t index = 0; index < kLaneCount; ++index) {
+    for (size_t index = 0; index < control_->header.lane_count; ++index) {
         auto& lane = control_->lanes[index];
         const uint32_t state = loadLaneState(lane.header);
         if (state == static_cast<uint32_t>(LaneState::kFree)) {
@@ -798,7 +808,7 @@ Status PeerMapping::claimLane(const ProcessIdentity& sender,
 
 Status PeerMapping::releaseLane(const ProcessIdentity& sender,
                                 uint64_t sender_epoch, size_t lane_index) {
-    if (lane_index >= kLaneCount) {
+    if (lane_index >= control_->header.lane_count) {
         return Status::InvalidArgument("invalid PXN lane index");
     }
     std::lock_guard<std::mutex> local_lock(mutex_);
@@ -823,7 +833,7 @@ Status PeerMapping::releaseLane(const ProcessIdentity& sender,
         lane_index_ == lane_index) {
         sender_ = {};
         sender_epoch_ = 0;
-        lane_index_ = kLaneCount;
+        lane_index_ = kMaxLaneCount;
     }
     return Status::OK();
 }
@@ -831,7 +841,7 @@ Status PeerMapping::releaseLane(const ProcessIdentity& sender,
 Status PeerMapping::attachArena() {
     std::lock_guard<std::mutex> local_lock(mutex_);
     if (arena_attached_) return Status::OK();
-    if (lane_index_ >= kLaneCount || sender_epoch_ == 0) {
+    if (lane_index_ >= control_->header.lane_count || sender_epoch_ == 0) {
         return Status::InvalidArgument("PXN lane is not claimed");
     }
     FileLock lock(fd_);
@@ -865,7 +875,7 @@ Status PeerMapping::detachArena() {
     FileLock lock(fd_);
     auto status = lock.lock();
     if (!status.ok()) return status;
-    if (lane_index_ < kLaneCount) {
+    if (lane_index_ < control_->header.lane_count) {
         auto& lane = control_->lanes[lane_index_];
         if (lane.header.sender == sender_ &&
             lane.header.sender_epoch == sender_epoch_) {
@@ -980,6 +990,12 @@ Status Registry::Open(RegistryOptions options,
 Status Registry::createLocal(
     std::span<const std::string> rails, const CudaIpcHandle& arena_handle,
     std::unique_ptr<RegistryRegistration>& registration) {
+    const auto& config = globalConfig();
+    const PxnGeometry geometry{config.pxn_lane_count, config.pxn_slots_per_lane,
+                               config.pxn_slot_size};
+    if (!geometry.valid()) {
+        return Status::InvalidArgument("invalid PXN registry geometry");
+    }
     std::string encoded_rails;
     auto status = encodeRails(rails, encoded_rails);
     if (!status.ok()) return status;
@@ -1023,10 +1039,10 @@ Status Registry::createLocal(
     control->header.mapping_bytes = sizeof(ControlBlock);
     control->header.owner = identity_;
     control->header.epoch = epoch_;
-    control->header.lane_count = kLaneCount;
-    control->header.slots_per_lane = kSlotsPerLane;
-    control->header.slot_size = kSlotSize;
-    control->header.arena_size = kRequiredArenaSize;
+    control->header.lane_count = geometry.lane_count;
+    control->header.slots_per_lane = geometry.slots_per_lane;
+    control->header.slot_size = geometry.slot_size;
+    control->header.arena_size = geometry.arenaSize();
     control->header.rail_bytes = static_cast<uint32_t>(encoded_rails.size());
     control->header.rail_count = static_cast<uint32_t>(rails.size());
     control->header.ipc_handle_bytes = kCudaIpcHandleSize;
@@ -1066,8 +1082,9 @@ Status Registry::discover(std::vector<RegistryEntry>& entries) {
     for (auto& entry : all_entries) {
         if (entry.identity != identity_) peers.push_back(std::move(entry));
     }
-    if (peers.size() > kLaneCount) {
-        return Status::TooManyRequests("PXN group has more than eight ranks");
+    if (peers.size() > globalConfig().pxn_lane_count) {
+        return Status::TooManyRequests(
+            "PXN group exceeds configured lane capacity");
     }
     entries = std::move(peers);
     return Status::OK();

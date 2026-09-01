@@ -127,7 +127,7 @@ class StagingArena {
     StagingArena(const StagingArena&) = delete;
     StagingArena& operator=(const StagingArena&) = delete;
 
-    Status initialize(StagingBackend& backend);
+    Status initialize(StagingBackend& backend, PxnGeometry geometry = {});
     Status shutdown();
     void abandon();
 
@@ -138,11 +138,13 @@ class StagingArena {
                                          size_t slot_index) const;
     bool ready() const { return ready_; }
     bool quarantined() const { return quarantine_.quarantined(); }
+    const PxnGeometry& geometry() const { return geometry_; }
 
    private:
     StagingBackend* backend_ = nullptr;
     uintptr_t address_ = 0;
     CudaIpcHandle handle_{};
+    PxnGeometry geometry_{};
     bool allocated_ = false;
     bool registered_ = false;
     bool ready_ = false;
@@ -213,8 +215,9 @@ struct SenderCopy {
 struct SenderLaneEndpoint {
     uint64_t epoch = 0;
     uintptr_t arena_address = 0;
-    size_t lane_index = kLaneCount;
+    size_t lane_index = kMaxLaneCount;
     ControlBlock* control = nullptr;
+    PxnGeometry geometry{};
 };
 
 class SenderReadyFence {
@@ -390,24 +393,51 @@ class RelayTransfer {
     virtual void abandon() = 0;
 };
 
+struct RelayBatchItem {
+    RelaySubmission submission;
+    Status status;
+    std::unique_ptr<RelayTransfer> transfer;
+};
+
 class RelayBackend {
    public:
     virtual ~RelayBackend() = default;
     virtual Status submit(const RelaySubmission& submission,
                           std::unique_ptr<RelayTransfer>& transfer) = 0;
+    virtual Status submitBatch(std::span<RelayBatchItem> items);
 };
 
 class RelayPipeline {
    public:
+    struct LaneSlotStats {
+        bool active = false;
+        size_t empty = kSlotsPerLane;
+        size_t cuda_pending = 0;
+        size_t rdma_pending = 0;
+    };
+
+    struct InflightStats {
+        size_t current = 0;
+        size_t limit = 0;
+        size_t high_watermark = 0;
+        uint64_t limit_blocked_pieces = 0;
+        uint64_t submit_batches = 0;
+        uint64_t submitted_batch_slots = 0;
+        size_t submit_batch_high_watermark = 0;
+    };
+
     RelayPipeline(ControlBlock* control, uintptr_t arena_address,
                   uint64_t epoch, size_t max_inflight,
-                  std::unique_ptr<RelayBackend> backend);
+                  std::unique_ptr<RelayBackend> backend,
+                  PxnGeometry geometry = {});
     ~RelayPipeline();
 
     Status reapInbound(bool& made_progress);
     Status progressInbound(bool& made_progress);
     bool hasInflight() const { return inflight_count_ != 0; }
     void shutdown();
+    std::array<LaneSlotStats, kMaxLaneCount> laneSlotStats() const;
+    InflightStats inflightStats() const;
 
     // Cumulative counters for each relay pipeline boundary.
     uint64_t readyBytes() const {
@@ -435,17 +465,30 @@ class RelayPipeline {
         std::unique_ptr<RelayTransfer> transfer;
     };
 
-    Status progressInboundOne(bool& made_progress);
+    struct PendingInbound {
+        size_t lane_index;
+        uint64_t sequence;
+        uint64_t piece_length;
+        RelayBatchItem item;
+    };
+
+    Status collectInboundOne(std::vector<PendingInbound>& pending,
+                             bool& made_progress);
+    void enqueueInflight(size_t lane_index, uint64_t sequence,
+                         std::unique_ptr<RelayTransfer> transfer);
     void complete(size_t lane_index, uint64_t sequence, int32_t status);
 
     ControlBlock* control_;
     uintptr_t arena_address_;
     uint64_t epoch_;
     size_t max_inflight_;
+    PxnGeometry geometry_;
     std::unique_ptr<RelayBackend> backend_;
-    std::array<uint64_t, kLaneCount> next_sequence_{};
-    std::array<uint64_t, kLaneCount> lane_sender_epoch_{};
-    std::array<std::deque<Inflight>, kLaneCount> inflight_;
+    std::array<uint64_t, kMaxLaneCount> next_sequence_{};
+    std::array<uint64_t, kMaxLaneCount> lane_sender_epoch_{};
+    std::array<std::deque<Inflight>, kMaxLaneCount> inflight_;
+    std::vector<PendingInbound> pending_batch_;
+    std::vector<RelayBatchItem> backend_batch_;
     std::atomic<uint64_t> ready_bytes_{0};
     std::atomic<uint64_t> submitted_bytes_{0};
     std::atomic<uint64_t> relayed_bytes_{0};
@@ -453,6 +496,14 @@ class RelayPipeline {
     std::atomic<uint64_t> submitted_pieces_{0};
     std::atomic<uint64_t> relayed_pieces_{0};
     size_t inflight_count_ = 0;
+    // Monitoring only: peak concurrent relay submissions and pieces that were
+    // ready but blocked by the inflight limit, surfaced via inflightStats().
+    size_t inflight_high_watermark_ = 0;
+    uint64_t limit_blocked_pieces_ = 0;
+    uint64_t submit_batches_ = 0;
+    uint64_t submitted_batch_slots_ = 0;
+    size_t submit_batch_high_watermark_ = 0;
+    std::array<uint64_t, kMaxLaneCount> last_limit_blocked_sequence_{};
     size_t next_lane_ = 0;
 };
 
@@ -487,7 +538,7 @@ std::unique_ptr<SenderFallback> makeRdmaSenderFallback(
 Status makeRdmaRelayBackend(RdmaTransport& transport, uintptr_t arena_address,
                             std::span<const std::string> source_device_names,
                             std::span<const std::string> source_rails,
-                            size_t max_inflight,
+                            size_t max_inflight, PxnGeometry geometry,
                             std::unique_ptr<RelayBackend>& backend);
 
 }  // namespace pxn

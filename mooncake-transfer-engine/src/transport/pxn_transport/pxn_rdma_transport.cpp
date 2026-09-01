@@ -218,10 +218,15 @@ int PxnRdmaTransport::install(std::string& local_server_name,
         return result;
     }
     std::unique_ptr<pxn::RelayBackend> relay_backend;
+    const pxn::PxnGeometry geometry{globalConfig().pxn_lane_count,
+                                    globalConfig().pxn_slots_per_lane,
+                                    globalConfig().pxn_slot_size};
+    const size_t relay_inflight =
+        std::min(globalConfig().pxn_inflight_depth,
+                 geometry.lane_count * geometry.slots_per_lane);
     status = pxn::makeRdmaRelayBackend(*this, resources_->arena().address(),
                                        active_hcas, resources_->localRails(),
-                                       globalConfig().pxn_inflight_depth,
-                                       relay_backend);
+                                       relay_inflight, geometry, relay_backend);
     if (!status.ok()) {
         LOG(WARNING) << "PXN is disabled: " << status.ToString();
         resources_.reset();
@@ -233,8 +238,8 @@ int PxnRdmaTransport::install(std::string& local_server_name,
         std::chrono::milliseconds(globalConfig().pxn_credit_timeout_ms));
     relay_pipeline_ = std::make_unique<pxn::RelayPipeline>(
         resources_->registration().control(), resources_->arena().address(),
-        resources_->registry().epoch(), globalConfig().pxn_inflight_depth,
-        std::move(relay_backend));
+        resources_->registry().epoch(), relay_inflight,
+        std::move(relay_backend), geometry);
     pump_ = std::make_unique<pxn::PxnPump>(*sender_pipeline_, *relay_pipeline_);
     return result;
 }
@@ -296,7 +301,8 @@ Status PxnRdmaTransport::submitTransferTask(
     std::vector<Pending> pending;
     for (auto& group : groups) {
         std::vector<pxn::Piece> pieces;
-        auto status = pxn::buildPieces(group.spans, pieces);
+        auto status =
+            pxn::buildPieces(group.spans, pieces, globalConfig().pxn_slot_size);
         if (!status.ok()) {
             direct_tasks.insert(direct_tasks.end(), group.tasks.begin(),
                                 group.tasks.end());
@@ -632,8 +638,45 @@ void PxnRdmaTransport::reportPxnStats() {
         << " | route_cache: hit=" << pxn_stats_.route_cache_hit.load()
         << " miss=" << pxn_stats_.route_cache_miss.load();
 
-    LOG(INFO) << "PXN pipeline: fallback_bytes="
-              << sender_pipeline_->fallbackBytes();
+    const auto lanes = relay_pipeline_->laneSlotStats();
+    const auto inflight = relay_pipeline_->inflightStats();
+    std::string empty;
+    std::string cuda_pending;
+    std::string rdma_pending;
+    size_t total_empty = 0;
+    for (size_t index = 0; index < lanes.size(); ++index) {
+        const auto& lane = lanes[index];
+        if (!empty.empty()) {
+            empty += ',';
+            cuda_pending += ',';
+            rdma_pending += ',';
+        }
+        const std::string label = "lane" + std::to_string(index) + ':';
+        empty += label;
+        cuda_pending += label;
+        rdma_pending += label;
+        if (!lane.active) {
+            empty += '-';
+            cuda_pending += '-';
+            rdma_pending += '-';
+            continue;
+        }
+        empty += std::to_string(lane.empty);
+        cuda_pending += std::to_string(lane.cuda_pending);
+        rdma_pending += std::to_string(lane.rdma_pending);
+        total_empty += lane.empty;
+    }
+    LOG(INFO) << "PXN slots: empty=[" << empty
+              << "] total_empty=" << total_empty << " cuda_pending=["
+              << cuda_pending << "] rdma_pending=[" << rdma_pending
+              << "] relay_inflight=" << inflight.current
+              << " relay_inflight_limit=" << inflight.limit
+              << " relay_inflight_hwm=" << inflight.high_watermark
+              << " relay_limit_blocked_pieces=" << inflight.limit_blocked_pieces
+              << " relay_submit_batches=" << inflight.submit_batches
+              << " relay_submit_batch_slots=" << inflight.submitted_batch_slots
+              << " relay_submit_batch_hwm="
+              << inflight.submit_batch_high_watermark;
 }
 
 }  // namespace mooncake

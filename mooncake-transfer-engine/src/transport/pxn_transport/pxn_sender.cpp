@@ -71,8 +71,9 @@ Status SenderLane::Create(SenderLaneEndpoint endpoint, SenderBackend& backend,
                           std::chrono::milliseconds credit_timeout,
                           std::unique_ptr<SenderLane>& lane) {
     if (endpoint.epoch == 0 || endpoint.arena_address == 0 ||
-        endpoint.lane_index >= kLaneCount || endpoint.control == nullptr ||
-        credit_timeout.count() <= 0) {
+        !endpoint.geometry.valid() ||
+        endpoint.lane_index >= endpoint.geometry.lane_count ||
+        endpoint.control == nullptr || credit_timeout.count() <= 0) {
         return Status::InvalidArgument("invalid PXN sender lane endpoint");
     }
     std::unique_ptr<SenderLaneHandle> handle;
@@ -112,7 +113,8 @@ Status SenderLane::reap(bool& made_progress) {
     auto& lane = endpoint_.control->lanes[endpoint_.lane_index];
     while (!inflight_.empty()) {
         auto& published = inflight_.front();
-        auto slot = slotIndex(published.sequence);
+        auto slot =
+            slotIndex(published.sequence, endpoint_.geometry.slots_per_lane);
         if (!slot.has_value()) {
             return Status::InvalidArgument("invalid PXN published sequence");
         }
@@ -144,7 +146,7 @@ Status SenderLane::reap(bool& made_progress) {
 Status SenderLane::progress(bool& made_progress) {
     made_progress = false;
     Status first_error;
-    for (size_t count = 0; count < kSlotsPerLane; ++count) {
+    for (size_t count = 0; count < endpoint_.geometry.slots_per_lane; ++count) {
         bool progress = false;
         auto status = progressOne(progress);
         if (first_error.ok() && !status.ok()) first_error = status;
@@ -200,7 +202,9 @@ Status SenderLane::progressOne(bool& made_progress) {
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
         if (queue_.empty()) return first_error;
-        if (!use_fallback && !hasRingCredit(next_sequence_, reaped_sequence_)) {
+        if (!use_fallback &&
+            !hasRingCredit(next_sequence_, reaped_sequence_,
+                           endpoint_.geometry.slots_per_lane)) {
             const auto elapsed =
                 std::chrono::steady_clock::now() - queue_.front().enqueue_time;
             if (elapsed < credit_timeout_) return first_error;
@@ -362,7 +366,7 @@ Status SenderLane::pollFallbacks(bool& made_progress) {
 Status SenderLane::publish(QueuedSubmission submission, uint64_t sequence,
                            SenderPublishState& state, bool& quarantine_lane) {
     quarantine_lane = false;
-    auto slot = slotIndex(sequence);
+    auto slot = slotIndex(sequence, endpoint_.geometry.slots_per_lane);
     if (!slot.has_value()) {
         quarantine_lane = true;
         auto status = deferOrStartFallback(std::move(submission));
@@ -375,14 +379,15 @@ Status SenderLane::publish(QueuedSubmission submission, uint64_t sequence,
     auto status = prepareDescriptor(
         submission.submission.piece, submission.submission.session,
         endpoint_.epoch, submission.submission.rail_index,
-        lane.descriptors[*slot]);
+        lane.descriptors[*slot], endpoint_.geometry.slot_size);
     if (!status.ok()) {
         auto fallback_status = deferOrStartFallback(std::move(submission));
         return fallback_status.ok() ? status : fallback_status;
     }
 
     const size_t slot_offset =
-        (endpoint_.lane_index * kSlotsPerLane + *slot) * kSlotSize;
+        (endpoint_.lane_index * endpoint_.geometry.slots_per_lane + *slot) *
+        endpoint_.geometry.slot_size;
     if (endpoint_.arena_address >
         std::numeric_limits<uintptr_t>::max() - slot_offset) {
         auto fallback_status = deferOrStartFallback(std::move(submission));
@@ -473,8 +478,14 @@ Status SenderPipeline::addPeer(PeerResources& peer, SenderLane*& lane) {
         return Status::OK();
     }
 
-    SenderLaneEndpoint endpoint{peer.entry().epoch, peer.address(),
-                                peer.laneIndex(), peer.controlBlock()};
+    const auto* control = peer.controlBlock();
+    SenderLaneEndpoint endpoint{
+        peer.entry().epoch,
+        peer.address(),
+        peer.laneIndex(),
+        control,
+        {control->header.lane_count, control->header.slots_per_lane,
+         static_cast<size_t>(control->header.slot_size)}};
     std::unique_ptr<SenderLane> candidate;
     auto status = SenderLane::Create(endpoint, *backend_, *fallback_,
                                      credit_timeout_, candidate);

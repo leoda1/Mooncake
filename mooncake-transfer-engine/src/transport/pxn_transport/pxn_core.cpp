@@ -28,8 +28,8 @@ bool rangeOverflows(uint64_t address, uint64_t length) {
            address > std::numeric_limits<uint64_t>::max() - (length - 1);
 }
 
-Status validatePiece(const Piece& piece) {
-    if (piece.length == 0 || piece.length > kSlotSize) {
+Status validatePiece(const Piece& piece, size_t slot_size) {
+    if (slot_size == 0 || piece.length == 0 || piece.length > slot_size) {
         return Status::InvalidArgument("invalid PXN piece length");
     }
     if (piece.spans.empty() || piece.spans.size() > kMaxPlanCount) {
@@ -68,14 +68,18 @@ std::optional<std::string> RailResolver::resolveUnique(
     return canonicalize(rails.front());
 }
 
-std::optional<size_t> slotIndex(uint64_t sequence) {
-    if (sequence == 0) return std::nullopt;
-    return static_cast<size_t>((sequence - 1) % kSlotsPerLane);
+std::optional<size_t> slotIndex(uint64_t sequence, size_t slots_per_lane) {
+    if (sequence == 0 || slots_per_lane == 0) return std::nullopt;
+    return static_cast<size_t>((sequence - 1) % slots_per_lane);
 }
 
-bool hasRingCredit(uint64_t next_sequence, uint64_t reaped_sequence) {
-    if (next_sequence == 0 || next_sequence <= reaped_sequence) return false;
-    return next_sequence - reaped_sequence <= kSlotsPerLane;
+bool hasRingCredit(uint64_t next_sequence, uint64_t reaped_sequence,
+                   size_t slots_per_lane) {
+    if (slots_per_lane == 0 || next_sequence == 0 ||
+        next_sequence <= reaped_sequence) {
+        return false;
+    }
+    return next_sequence - reaped_sequence <= slots_per_lane;
 }
 
 bool advanceSequence(uint64_t sequence, uint64_t& next_sequence) {
@@ -88,7 +92,10 @@ bool advanceSequence(uint64_t sequence, uint64_t& next_sequence) {
 }
 
 Status buildPieces(std::span<const TransferSpan> spans,
-                   std::vector<Piece>& pieces) {
+                   std::vector<Piece>& pieces, size_t slot_size) {
+    if (slot_size == 0) {
+        return Status::InvalidArgument("invalid PXN slot size");
+    }
     std::vector<Piece> result;
 
     for (const auto& span : spans) {
@@ -99,13 +106,13 @@ Status buildPieces(std::span<const TransferSpan> spans,
 
         uint64_t offset = 0;
         while (offset < span.length) {
-            if (result.empty() || result.back().length == kSlotSize ||
+            if (result.empty() || result.back().length == slot_size ||
                 result.back().spans.size() == kMaxPlanCount) {
                 result.emplace_back();
             }
 
             auto& piece = result.back();
-            const uint64_t available = kSlotSize - piece.length;
+            const uint64_t available = slot_size - piece.length;
             const uint64_t length = std::min(span.length - offset, available);
             piece.spans.push_back({span.source + offset,
                                    span.final_destination + offset, length,
@@ -121,8 +128,8 @@ Status buildPieces(std::span<const TransferSpan> spans,
 
 Status prepareDescriptor(const Piece& piece, std::string_view session,
                          uint64_t epoch, uint32_t rail_index,
-                         Descriptor& descriptor) {
-    auto status = validatePiece(piece);
+                         Descriptor& descriptor, size_t slot_size) {
+    auto status = validatePiece(piece, slot_size);
     if (!status.ok()) return status;
     if (session.empty() || session.size() > kMaxSessionLength) {
         return Status::InvalidArgument("invalid PXN session length");
@@ -160,7 +167,7 @@ uint64_t loadDescriptorSequence(const Descriptor& descriptor) {
 
 DescriptorError validateDescriptor(const Descriptor& descriptor,
                                    uint64_t expected_sequence,
-                                   uint64_t expected_epoch) {
+                                   uint64_t expected_epoch, size_t slot_size) {
     if (expected_sequence == 0 ||
         loadDescriptorSequence(descriptor) != expected_sequence) {
         return DescriptorError::kSequence;
@@ -168,7 +175,8 @@ DescriptorError validateDescriptor(const Descriptor& descriptor,
     if (expected_epoch == 0 || descriptor.epoch != expected_epoch) {
         return DescriptorError::kEpoch;
     }
-    if (descriptor.piece_length == 0 || descriptor.piece_length > kSlotSize) {
+    if (slot_size == 0 || descriptor.piece_length == 0 ||
+        descriptor.piece_length > slot_size) {
         return DescriptorError::kPieceLength;
     }
     if (descriptor.plan_count == 0 || descriptor.plan_count > kMaxPlanCount) {

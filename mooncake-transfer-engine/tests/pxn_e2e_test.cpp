@@ -334,7 +334,7 @@ TEST(PxnE2ETest, CrossRail10KiBRelays) {
 }
 
 // ---------------------------------------------------------------------------
-// 2. 8 MiB exactly, and the two boundaries either side of a full slot.
+// 2. 512 KiB exactly, and the two boundaries either side of a full slot.
 // ---------------------------------------------------------------------------
 
 TEST(PxnE2ETest, SlotSizeBoundaries) {
@@ -344,9 +344,9 @@ TEST(PxnE2ETest, SlotSizeBoundaries) {
         size_t expected_pieces;
     };
     const Case cases[] = {
-        {"8MiB-1", kSlotSize - 1, 1},
-        {"8MiB", kSlotSize, 1},
-        {"8MiB+1", kSlotSize + 1, 2},
+        {"512KiB-1", kSlotSize - 1, 1},
+        {"512KiB", kSlotSize, 1},
+        {"512KiB+1", kSlotSize + 1, 2},
     };
 
     for (const auto& test_case : cases) {
@@ -374,6 +374,26 @@ TEST(PxnE2ETest, SlotSizeBoundaries) {
         EXPECT_EQ(env.relay().relayedBytes(), test_case.length);
         EXPECT_EQ(lane->fallbackBytes(), 0u);
     }
+}
+
+TEST(PxnE2ETest, RuntimeSlotSizeControlsPieceBoundaries) {
+    constexpr size_t kRuntimeSlotSize = 256 * 1024;
+    std::vector<TransferSpan> spans{
+        {0x10000000, 0x20000000, kRuntimeSlotSize + 1, 0}};
+    std::vector<Piece> pieces;
+    ASSERT_TRUE(buildPieces(spans, pieces, kRuntimeSlotSize).ok());
+    ASSERT_EQ(pieces.size(), 2u);
+    EXPECT_EQ(pieces[0].length, kRuntimeSlotSize);
+    EXPECT_EQ(pieces[1].length, 1u);
+}
+
+TEST(PxnE2ETest, RuntimeSlotCountControlsRingCreditAndWrap) {
+    constexpr size_t kRuntimeSlots = 3;
+    EXPECT_TRUE(hasRingCredit(3, 0, kRuntimeSlots));
+    EXPECT_FALSE(hasRingCredit(4, 0, kRuntimeSlots));
+    const auto slot = slotIndex(4, kRuntimeSlots);
+    ASSERT_TRUE(slot.has_value());
+    EXPECT_EQ(*slot, 0u);
 }
 
 // ---------------------------------------------------------------------------
@@ -463,21 +483,21 @@ TEST(PxnE2ETest, EighteenPiecesFillRingNineteenthReusesSlotZero) {
 }
 
 // ---------------------------------------------------------------------------
-// 4. 5 GiB splits into exactly 640 Pieces, and 640 Pieces really do wrap the
-//    18-slot ring many times with every byte verified.
+// 4. 5 GiB splits into exactly 10240 Pieces, and a representative 640 Pieces
+//    really do wrap the 18-slot ring many times with every byte verified.
 // ---------------------------------------------------------------------------
 
 // buildPieces() never dereferences the span addresses, so the 5 GiB split can
 // be checked without allocating 5 GiB.
-TEST(PxnE2ETest, FiveGiBSplitsIntoSixHundredFortyPieces) {
+TEST(PxnE2ETest, FiveGiBSplitsIntoTenThousandTwoHundredFortyPieces) {
     constexpr uint64_t kLength = 5ULL * 1024 * 1024 * 1024;
     std::vector<TransferSpan> spans;
     spans.push_back({0x10000000ULL, 0x20000000ULL, kLength, 0});
 
     std::vector<Piece> pieces;
     ASSERT_TRUE(buildPieces(spans, pieces).ok());
-    EXPECT_EQ(pieces.size(), 640u);
-    EXPECT_EQ(kLength / kSlotSize, 640u);
+    EXPECT_EQ(pieces.size(), 10240u);
+    EXPECT_EQ(kLength / kSlotSize, 10240u);
 
     uint64_t total = 0;
     for (const auto& piece : pieces) {
@@ -489,7 +509,7 @@ TEST(PxnE2ETest, FiveGiBSplitsIntoSixHundredFortyPieces) {
 
 // Moves 640 Pieces through the lane for real. Piece size is kept at 64 KiB so
 // the test stays memory-light; the 5 GiB Piece-count math is covered above and
-// the full 8 MiB slot is covered by SlotSizeBoundaries.
+// the full 512 KiB slot is covered by SlotSizeBoundaries.
 TEST(PxnE2ETest, SixHundredFortyPiecesWrapRingAndVerifyPayload) {
     constexpr size_t kPieces = 640;
     constexpr size_t kPayload = 64 * 1024;

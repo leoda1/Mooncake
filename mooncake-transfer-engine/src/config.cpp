@@ -101,7 +101,11 @@ bool isValidPxnRailMap(
 }
 
 bool isValidPxnConfig(const GlobalConfig& config) {
-    return pxn::isValidGroupId(config.pxn_group_id) &&
+    const bool geometry_valid =
+        pxn::PxnGeometry{config.pxn_lane_count, config.pxn_slots_per_lane,
+                         config.pxn_slot_size}
+            .valid();
+    return pxn::isValidGroupId(config.pxn_group_id) && geometry_valid &&
            config.pxn_inflight_depth >= 1 && config.pxn_inflight_depth <= 64 &&
            config.pxn_credit_timeout_ms > 0 &&
            config.pxn_heartbeat_timeout_ms > 0 &&
@@ -505,6 +509,21 @@ void loadGlobalConfig(GlobalConfig& config) {
             parseUnsignedConfigEnv(value, "MC_PXN_INFLIGHT_DEPTH", size_t{1},
                                    size_t{64}, config.pxn_inflight_depth);
     }
+    if (const char* value = std::getenv("MC_PXN_LANE_COUNT")) {
+        pxn_config_valid &=
+            parseUnsignedConfigEnv(value, "MC_PXN_LANE_COUNT", size_t{1},
+                                   pxn::kMaxLaneCount, config.pxn_lane_count);
+    }
+    if (const char* value = std::getenv("MC_PXN_SLOTS_PER_LANE")) {
+        pxn_config_valid &= parseUnsignedConfigEnv(
+            value, "MC_PXN_SLOTS_PER_LANE", size_t{1}, pxn::kMaxSlotsPerLane,
+            config.pxn_slots_per_lane);
+    }
+    if (const char* value = std::getenv("MC_PXN_SLOT_SIZE")) {
+        pxn_config_valid &= parseUnsignedConfigEnv(
+            value, "MC_PXN_SLOT_SIZE", size_t{1},
+            std::numeric_limits<size_t>::max(), config.pxn_slot_size);
+    }
     if (const char* value = std::getenv("MC_PXN_CREDIT_TIMEOUT_MS")) {
         pxn_config_valid &= parseUnsignedConfigEnv(
             value, "MC_PXN_CREDIT_TIMEOUT_MS", uint32_t{1},
@@ -883,6 +902,9 @@ void dumpGlobalConfig() {
               << config.te_metadata_refresh_interval_seconds;
     LOG(INFO) << "rdma_rail_pause_seconds = " << config.rdma_rail_pause_seconds;
     LOG(INFO) << "pxn_enable = " << (config.pxn_enable ? "true" : "false");
+    LOG(INFO) << "pxn_lane_count = " << config.pxn_lane_count;
+    LOG(INFO) << "pxn_slots_per_lane = " << config.pxn_slots_per_lane;
+    LOG(INFO) << "pxn_slot_size = " << config.pxn_slot_size;
     LOG(INFO) << "pxn_inflight_depth = " << config.pxn_inflight_depth;
     LOG(INFO) << "pxn_credit_timeout_ms = " << config.pxn_credit_timeout_ms;
     LOG(INFO) << "pxn_heartbeat_timeout_ms = "

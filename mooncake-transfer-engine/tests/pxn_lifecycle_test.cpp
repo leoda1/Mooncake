@@ -24,6 +24,7 @@
 #include <string>
 #include <vector>
 
+#include "config.h"
 #include "transport/pxn_transport/pxn_transport.h"
 
 namespace mooncake {
@@ -32,6 +33,7 @@ namespace {
 
 struct BackendState {
     uintptr_t local_address = 0;
+    size_t expected_arena_size = kDefaultArenaSize;
     bool fail_register = false;
     bool fail_export = false;
     std::vector<std::string> calls;
@@ -44,7 +46,7 @@ class FakeBackend final : public StagingBackend {
 
     Status allocateArena(size_t size, uintptr_t& address) override {
         state_->calls.push_back("allocate");
-        if (size != kRequiredArenaSize) {
+        if (size != state_->expected_arena_size) {
             return Status::InvalidArgument("unexpected arena size");
         }
         address = state_->local_address;
@@ -125,6 +127,28 @@ RegistryOptions registryOptions(const TemporaryDirectory& directory,
     return options;
 }
 
+class ScopedPxnGeometryConfig {
+   public:
+    explicit ScopedPxnGeometryConfig(PxnGeometry geometry)
+        : config_(globalConfig()),
+          saved_{config_.pxn_lane_count, config_.pxn_slots_per_lane,
+                 config_.pxn_slot_size} {
+        config_.pxn_lane_count = geometry.lane_count;
+        config_.pxn_slots_per_lane = geometry.slots_per_lane;
+        config_.pxn_slot_size = geometry.slot_size;
+    }
+
+    ~ScopedPxnGeometryConfig() {
+        config_.pxn_lane_count = saved_.lane_count;
+        config_.pxn_slots_per_lane = saved_.slots_per_lane;
+        config_.pxn_slot_size = saved_.slot_size;
+    }
+
+   private:
+    GlobalConfig& config_;
+    PxnGeometry saved_;
+};
+
 TEST(PxnLifecycleTest, MapsPeerLaneAndHoldsArenaLease) {
     TemporaryDirectory directory;
     auto relay_state = std::make_shared<BackendState>();
@@ -185,6 +209,48 @@ TEST(PxnLifecycleTest, RollsBackExportAndQuarantinesRegistrationFailure) {
     EXPECT_TRUE(register_arena.quarantined());
     EXPECT_EQ(register_state->calls,
               (std::vector<std::string>{"allocate", "register"}));
+}
+
+TEST(PxnLifecycleTest, StagingArenaUsesRuntimeGeometry) {
+    constexpr PxnGeometry geometry{2, 3, 256 * 1024};
+    auto state = std::make_shared<BackendState>();
+    state->local_address = 0x500000000ULL;
+    state->expected_arena_size = geometry.arenaSize();
+    FakeBackend backend(state);
+    StagingArena arena;
+
+    ASSERT_TRUE(arena.initialize(backend, geometry).ok());
+    EXPECT_EQ(
+        arena.laneAddress(1),
+        state->local_address + geometry.slots_per_lane * geometry.slot_size);
+    EXPECT_EQ(arena.slotAddress(1, 2),
+              state->local_address +
+                  (geometry.slots_per_lane + 2) * geometry.slot_size);
+    EXPECT_FALSE(arena.laneAddress(2).has_value());
+    EXPECT_FALSE(arena.slotAddress(1, 3).has_value());
+    EXPECT_TRUE(arena.shutdown().ok());
+}
+
+TEST(PxnLifecycleTest, RegistryPublishesRuntimeGeometry) {
+    constexpr PxnGeometry geometry{2, 3, 256 * 1024};
+    ScopedPxnGeometryConfig config_scope(geometry);
+    TemporaryDirectory directory;
+    auto state = std::make_shared<BackendState>();
+    state->local_address = 0x600000000ULL;
+    state->expected_arena_size = geometry.arenaSize();
+    const std::array<std::string, 1> hcas{"mlx5_0"};
+
+    std::unique_ptr<LocalResources> resources;
+    ASSERT_TRUE(
+        LocalResources::Create(registryOptions(directory, 1003, 33), hcas, {},
+                               std::make_unique<FakeBackend>(state), resources)
+            .ok());
+    const auto& header = resources->registration().control()->header;
+    EXPECT_EQ(header.lane_count, geometry.lane_count);
+    EXPECT_EQ(header.slots_per_lane, geometry.slots_per_lane);
+    EXPECT_EQ(header.slot_size, geometry.slot_size);
+    EXPECT_EQ(header.arena_size, geometry.arenaSize());
+    EXPECT_TRUE(resources->shutdown().ok());
 }
 
 }  // namespace

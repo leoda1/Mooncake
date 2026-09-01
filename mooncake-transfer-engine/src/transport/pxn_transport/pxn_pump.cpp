@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <limits>
 #include <memory>
 #include <string_view>
 #include <unordered_map>
@@ -30,6 +31,16 @@
 
 namespace mooncake {
 namespace pxn {
+
+Status RelayBackend::submitBatch(std::span<RelayBatchItem> items) {
+    Status first_error;
+    for (auto& item : items) {
+        item.status = submit(item.submission, item.transfer);
+        if (first_error.ok() && !item.status.ok()) first_error = item.status;
+    }
+    return first_error;
+}
+
 namespace {
 
 class CompletedRelayTransfer final : public RelayTransfer {
@@ -137,10 +148,10 @@ class RdmaRelayBackend final : public RelayBackend {
     static Status Create(RdmaTransport& transport, uintptr_t arena_address,
                          std::span<const std::string> source_device_names,
                          std::span<const std::string> source_rails,
-                         size_t max_inflight,
+                         size_t max_inflight, PxnGeometry geometry,
                          std::unique_ptr<RelayBackend>& backend) {
         auto candidate = std::unique_ptr<RdmaRelayBackend>(
-            new RdmaRelayBackend(transport, arena_address));
+            new RdmaRelayBackend(transport, arena_address, geometry));
         auto status = candidate->initialize(source_device_names, source_rails,
                                             max_inflight);
         if (!status.ok()) return status;
@@ -150,7 +161,99 @@ class RdmaRelayBackend final : public RelayBackend {
 
     Status submit(const RelaySubmission& submission,
                   std::unique_ptr<RelayTransfer>& transfer) override {
+        RelayBatchItem item;
+        item.submission = submission;
+        auto status = submitBatch(std::span<RelayBatchItem>(&item, 1));
+        transfer = std::move(item.transfer);
+        return item.status.ok() ? status : item.status;
+    }
+
+    Status submitBatch(std::span<RelayBatchItem> items) override {
         PXN_NVTX_RELAY("pxn::relay::submit");
+        Status first_error;
+        for (auto& transfers : prepared_) transfers.clear();
+        for (auto& slices : prepared_slices_) slices.clear();
+
+        for (auto& item : items) {
+            item.status = prepare(item.submission, item.transfer);
+            if (!item.status.ok()) {
+                if (first_error.ok()) first_error = item.status;
+                continue;
+            }
+            prepared_[item.submission.rail_index].push_back(
+                static_cast<RdmaRelayTransfer*>(item.transfer.get()));
+        }
+
+        for (size_t rail_index = 0; rail_index < prepared_.size();
+             ++rail_index) {
+            auto& transfers = prepared_[rail_index];
+            if (transfers.empty()) continue;
+            auto& slices = prepared_slices_[rail_index];
+            size_t slice_count = 0;
+            for (auto* transfer : transfers) {
+                slice_count += transfer->slices().size();
+            }
+            slices.reserve(slice_count);
+            for (auto* transfer : transfers) {
+                slices.insert(slices.end(), transfer->slices().begin(),
+                              transfer->slices().end());
+            }
+            const int result =
+                source_rails_[rail_index].context->submitPreparedPostSend(
+                    slices);
+            if (result == 0) {
+                for (auto* transfer : transfers) transfer->submitted();
+                continue;
+            }
+            auto failure =
+                Status::Context("PXN relay RDMA batch submission failed");
+            if (first_error.ok()) first_error = failure;
+            for (auto& item : items) {
+                if (item.status.ok() &&
+                    item.submission.rail_index == rail_index) {
+                    item.status = failure;
+                    item.transfer.reset();
+                }
+            }
+        }
+        return first_error;
+    }
+
+   private:
+    using MrKey = Transport::Slice::mr_key_t;
+
+    struct SourceRail {
+        std::string device_name;
+        std::string rail;
+        RdmaContext* context;
+        MrKey lkey;
+        int device_id;
+    };
+
+    struct TargetRoute {
+        uint32_t source_rail_index;
+        uint64_t begin;
+        uint64_t end;
+        MrKey rkey;
+        int device_id;
+        std::string peer_nic_path;
+    };
+
+    struct SessionRoutes {
+        Transport::SegmentID target_id;
+        std::shared_ptr<RdmaTransport::SegmentDesc> descriptor;
+        std::vector<TargetRoute> routes;
+    };
+
+    RdmaRelayBackend(RdmaTransport& transport, uintptr_t arena_address,
+                     PxnGeometry geometry)
+        : transport_(transport),
+          arena_address_(arena_address),
+          geometry_(geometry),
+          rail_resolver_(globalConfig().pxn_rail_map) {}
+
+    Status prepare(const RelaySubmission& submission,
+                   std::unique_ptr<RelayTransfer>& transfer) {
         if (submission.rail_index >= source_rails_.size()) {
             return Status::InvalidArgument("PXN relay rail index is invalid");
         }
@@ -199,58 +302,22 @@ class RdmaRelayBackend final : public RelayBackend {
                 slice->ts = 0;
             });
         if (!status.ok()) return status;
-
-        const int result =
-            source_rail.context->submitPreparedPostSend(candidate->slices());
-        if (result != 0) {
-            return Status::Context("PXN relay RDMA submission failed");
-        }
-        candidate->submitted();
         transfer = std::move(candidate);
         return Status::OK();
     }
-
-   private:
-    using MrKey = Transport::Slice::mr_key_t;
-
-    struct SourceRail {
-        std::string device_name;
-        std::string rail;
-        RdmaContext* context;
-        MrKey lkey;
-        int device_id;
-    };
-
-    struct TargetRoute {
-        uint32_t source_rail_index;
-        uint64_t begin;
-        uint64_t end;
-        MrKey rkey;
-        int device_id;
-        std::string peer_nic_path;
-    };
-
-    struct SessionRoutes {
-        Transport::SegmentID target_id;
-        std::shared_ptr<RdmaTransport::SegmentDesc> descriptor;
-        std::vector<TargetRoute> routes;
-    };
-
-    RdmaRelayBackend(RdmaTransport& transport, uintptr_t arena_address)
-        : transport_(transport),
-          arena_address_(arena_address),
-          rail_resolver_(globalConfig().pxn_rail_map) {}
 
     Status initialize(std::span<const std::string> source_device_names,
                       std::span<const std::string> source_rails,
                       size_t max_inflight) {
         if (source_device_names.empty() ||
             source_device_names.size() != source_rails.size() ||
-            source_device_names.size() > kMaxRailsPerRank) {
+            source_device_names.size() > kMaxRailsPerRank ||
+            !geometry_.valid()) {
             return Status::InvalidArgument(
                 "PXN relay source rails are invalid");
         }
         auto local = transport_.meta()->getSegmentDescByID(LOCAL_SEGMENT_ID);
+        const size_t arena_size = geometry_.arenaSize();
         const auto& contexts = transport_.getContextList();
         for (size_t index = 0; index < source_device_names.size(); ++index) {
             const auto& source_device_name = source_device_names[index];
@@ -260,9 +327,9 @@ class RdmaRelayBackend final : public RelayBackend {
             }
             int buffer_id = -1;
             int device_id = -1;
-            if (RdmaTransport::selectDevice(
-                    local.get(), arena_address_, kRequiredArenaSize,
-                    source_device_name, buffer_id, device_id) != 0) {
+            if (RdmaTransport::selectDevice(local.get(), arena_address_,
+                                            arena_size, source_device_name,
+                                            buffer_id, device_id) != 0) {
                 return Status::AddressNotRegistered(
                     "PXN staging arena is not registered by " +
                     source_device_name);
@@ -293,10 +360,20 @@ class RdmaRelayBackend final : public RelayBackend {
         if (slice_size_ == 0) {
             return Status::InvalidArgument("RDMA slice size must be nonzero");
         }
-        const size_t slices_per_piece =
-            kMaxPlanCount + (kSlotSize + slice_size_ - 1) / slice_size_;
+        const size_t slot_size = geometry_.slot_size;
+        const size_t slot_slices =
+            slot_size / slice_size_ + (slot_size % slice_size_ != 0);
+        if (slot_slices > std::numeric_limits<size_t>::max() - kMaxPlanCount ||
+            max_inflight > std::numeric_limits<size_t>::max() /
+                               (kMaxPlanCount + slot_slices)) {
+            return Status::InvalidArgument(
+                "PXN relay slice pool capacity overflows");
+        }
+        const size_t slices_per_piece = kMaxPlanCount + slot_slices;
         pool_ =
             std::make_shared<RelaySlicePool>(max_inflight * slices_per_piece);
+        prepared_.resize(source_rails_.size());
+        prepared_slices_.resize(source_rails_.size());
         return Status::OK();
     }
 
@@ -410,10 +487,13 @@ class RdmaRelayBackend final : public RelayBackend {
 
     RdmaTransport& transport_;
     uintptr_t arena_address_;
+    PxnGeometry geometry_;
     RailResolver rail_resolver_;
     std::vector<SourceRail> source_rails_;
     size_t slice_size_ = 0;
     std::shared_ptr<RelaySlicePool> pool_;
+    std::vector<std::vector<RdmaRelayTransfer*>> prepared_;
+    std::vector<std::vector<Transport::Slice*>> prepared_slices_;
     std::unordered_map<std::string, SessionRoutes> sessions_;
 };
 
@@ -421,11 +501,13 @@ class RdmaRelayBackend final : public RelayBackend {
 
 RelayPipeline::RelayPipeline(ControlBlock* control, uintptr_t arena_address,
                              uint64_t epoch, size_t max_inflight,
-                             std::unique_ptr<RelayBackend> backend)
+                             std::unique_ptr<RelayBackend> backend,
+                             PxnGeometry geometry)
     : control_(control),
       arena_address_(arena_address),
       epoch_(epoch),
       max_inflight_(max_inflight),
+      geometry_(geometry),
       backend_(std::move(backend)) {
     next_sequence_.fill(1);
 }
@@ -435,7 +517,8 @@ RelayPipeline::~RelayPipeline() { shutdown(); }
 Status RelayPipeline::reapInbound(bool& made_progress) {
     made_progress = false;
     Status first_error;
-    for (size_t lane_index = 0; lane_index < kLaneCount; ++lane_index) {
+    for (size_t lane_index = 0; lane_index < geometry_.lane_count;
+         ++lane_index) {
         auto& queue = inflight_[lane_index];
         while (!queue.empty()) {
             bool completed = false;
@@ -463,24 +546,78 @@ Status RelayPipeline::reapInbound(bool& made_progress) {
 Status RelayPipeline::progressInbound(bool& made_progress) {
     made_progress = false;
     Status first_error;
-    while (inflight_count_ < max_inflight_) {
+    pending_batch_.clear();
+    pending_batch_.reserve(max_inflight_ -
+                           std::min(max_inflight_, inflight_count_));
+    while (inflight_count_ + pending_batch_.size() < max_inflight_) {
         bool progress = false;
-        auto status = progressInboundOne(progress);
+        auto status = collectInboundOne(pending_batch_, progress);
         if (first_error.ok() && !status.ok()) first_error = status;
         made_progress = made_progress || progress;
         if (!status.ok() || !progress) break;
     }
+    if (inflight_count_ + pending_batch_.size() >= max_inflight_) {
+        for (size_t lane_index = 0; lane_index < geometry_.lane_count;
+             ++lane_index) {
+            const auto& lane = control_->lanes[lane_index];
+            if (loadLaneState(lane.header) !=
+                static_cast<uint32_t>(LaneState::kReady)) {
+                continue;
+            }
+            const uint64_t sequence = next_sequence_[lane_index];
+            const uint64_t doorbell =
+                __atomic_load_n(&lane.header.doorbell, __ATOMIC_ACQUIRE);
+            if (sequence == 0 || doorbell < sequence) continue;
+            if (last_limit_blocked_sequence_[lane_index] == sequence) continue;
+            last_limit_blocked_sequence_[lane_index] = sequence;
+            ++limit_blocked_pieces_;
+        }
+    }
+
+    if (pending_batch_.empty()) return first_error;
+
+    backend_batch_.clear();
+    backend_batch_.reserve(pending_batch_.size());
+    for (auto& entry : pending_batch_) {
+        backend_batch_.push_back(std::move(entry.item));
+    }
+    ++submit_batches_;
+    submitted_batch_slots_ += backend_batch_.size();
+    submit_batch_high_watermark_ =
+        std::max(submit_batch_high_watermark_, backend_batch_.size());
+    auto status = backend_->submitBatch(backend_batch_);
+    if (first_error.ok() && !status.ok()) first_error = status;
+
+    for (size_t index = 0; index < pending_batch_.size(); ++index) {
+        auto& entry = pending_batch_[index];
+        auto& item = backend_batch_[index];
+        if (item.status.ok() && item.transfer == nullptr) {
+            item.status =
+                Status::Context("PXN relay backend returned no transfer");
+        }
+        if (!item.status.ok() || item.transfer == nullptr) {
+            if (first_error.ok() && !item.status.ok()) {
+                first_error = item.status;
+            }
+            item.transfer =
+                std::make_unique<CompletedRelayTransfer>(ERR_CONTEXT);
+        } else {
+            submitted_bytes_.fetch_add(entry.piece_length,
+                                       std::memory_order_relaxed);
+            submitted_pieces_.fetch_add(1, std::memory_order_relaxed);
+        }
+        enqueueInflight(entry.lane_index, entry.sequence,
+                        std::move(item.transfer));
+    }
     return first_error;
 }
 
-Status RelayPipeline::progressInboundOne(bool& made_progress) {
+Status RelayPipeline::collectInboundOne(std::vector<PendingInbound>& pending,
+                                        bool& made_progress) {
     made_progress = false;
-    if (inflight_count_ >= max_inflight_) {
-        return Status::OK();
-    }
 
-    for (size_t offset = 0; offset < kLaneCount; ++offset) {
-        const size_t lane_index = (next_lane_ + offset) % kLaneCount;
+    for (size_t offset = 0; offset < geometry_.lane_count; ++offset) {
+        const size_t lane_index = (next_lane_ + offset) % geometry_.lane_count;
         auto& lane = control_->lanes[lane_index];
         if (loadLaneState(lane.header) !=
             static_cast<uint32_t>(LaneState::kReady)) {
@@ -490,7 +627,12 @@ Status RelayPipeline::progressInboundOne(bool& made_progress) {
         const uint64_t sender_epoch =
             __atomic_load_n(&lane.header.sender_epoch, __ATOMIC_ACQUIRE);
         if (lane_sender_epoch_[lane_index] != sender_epoch) {
-            if (!inflight_[lane_index].empty()) {
+            const bool lane_has_pending =
+                std::any_of(pending.begin(), pending.end(),
+                            [lane_index](const PendingInbound& entry) {
+                                return entry.lane_index == lane_index;
+                            });
+            if (!inflight_[lane_index].empty() || lane_has_pending) {
                 continue;
             }
             lane_sender_epoch_[lane_index] = sender_epoch;
@@ -502,24 +644,24 @@ Status RelayPipeline::progressInboundOne(bool& made_progress) {
             __atomic_load_n(&lane.header.doorbell, __ATOMIC_ACQUIRE);
         if (sequence == 0 || doorbell < sequence) continue;
 
-        const size_t slot = *slotIndex(sequence);
+        const size_t slot = *slotIndex(sequence, geometry_.slots_per_lane);
         const auto& descriptor = lane.descriptors[slot];
-        const auto descriptor_status =
-            validateDescriptor(descriptor, sequence, epoch_);
+        const auto descriptor_status = validateDescriptor(
+            descriptor, sequence, epoch_, geometry_.slot_size);
         if (descriptor_status != DescriptorError::kOk) {
-            inflight_[lane_index].push_back(
-                {sequence, std::make_unique<CompletedRelayTransfer>(
-                               ERR_INVALID_ARGUMENT)});
-            ++inflight_count_;
+            enqueueInflight(
+                lane_index, sequence,
+                std::make_unique<CompletedRelayTransfer>(ERR_INVALID_ARGUMENT));
             (void)advanceSequence(sequence, next_sequence_[lane_index]);
-            next_lane_ = (lane_index + 1) % kLaneCount;
+            next_lane_ = (lane_index + 1) % geometry_.lane_count;
             made_progress = true;
             return Status::OK();
         }
 
         RelaySubmission submission;
         submission.source =
-            arena_address_ + (lane_index * kSlotsPerLane + slot) * kSlotSize;
+            arena_address_ + (lane_index * geometry_.slots_per_lane + slot) *
+                                 geometry_.slot_size;
         submission.session.assign(descriptor.session,
                                   descriptor.session_length);
         submission.rail_index = descriptor.rail_index;
@@ -529,23 +671,24 @@ Status RelayPipeline::progressInboundOne(bool& made_progress) {
                                std::memory_order_relaxed);
         ready_pieces_.fetch_add(1, std::memory_order_relaxed);
 
-        std::unique_ptr<RelayTransfer> transfer;
-        auto status = backend_->submit(submission, transfer);
-        if (!status.ok()) {
-            transfer = std::make_unique<CompletedRelayTransfer>(ERR_CONTEXT);
-        } else {
-            submitted_bytes_.fetch_add(descriptor.piece_length,
-                                       std::memory_order_relaxed);
-            submitted_pieces_.fetch_add(1, std::memory_order_relaxed);
-        }
-        inflight_[lane_index].push_back({sequence, std::move(transfer)});
-        ++inflight_count_;
+        RelayBatchItem item;
+        item.submission = std::move(submission);
+        pending.push_back(
+            {lane_index, sequence, descriptor.piece_length, std::move(item)});
         (void)advanceSequence(sequence, next_sequence_[lane_index]);
-        next_lane_ = (lane_index + 1) % kLaneCount;
+        next_lane_ = (lane_index + 1) % geometry_.lane_count;
         made_progress = true;
-        return status;
+        return Status::OK();
     }
     return Status::OK();
+}
+
+void RelayPipeline::enqueueInflight(size_t lane_index, uint64_t sequence,
+                                    std::unique_ptr<RelayTransfer> transfer) {
+    inflight_[lane_index].push_back({sequence, std::move(transfer)});
+    ++inflight_count_;
+    inflight_high_watermark_ =
+        std::max(inflight_high_watermark_, inflight_count_);
 }
 
 void RelayPipeline::shutdown() {
@@ -559,10 +702,48 @@ void RelayPipeline::shutdown() {
     inflight_count_ = 0;
 }
 
+RelayPipeline::InflightStats RelayPipeline::inflightStats() const {
+    return {inflight_count_,
+            max_inflight_,
+            std::max(inflight_high_watermark_, inflight_count_),
+            limit_blocked_pieces_,
+            submit_batches_,
+            submitted_batch_slots_,
+            submit_batch_high_watermark_};
+}
+
+std::array<RelayPipeline::LaneSlotStats, kMaxLaneCount>
+RelayPipeline::laneSlotStats() const {
+    std::array<LaneSlotStats, kMaxLaneCount> result;
+    for (size_t index = 0; index < geometry_.lane_count; ++index) {
+        const auto& header = control_->lanes[index].header;
+        auto& stats = result[index];
+        stats.active =
+            loadLaneState(header) == static_cast<uint32_t>(LaneState::kReady);
+        if (!stats.active) continue;
+
+        const uint64_t completed =
+            __atomic_load_n(&header.completed, __ATOMIC_ACQUIRE);
+        uint64_t doorbell = __atomic_load_n(&header.doorbell, __ATOMIC_ACQUIRE);
+        uint64_t head = __atomic_load_n(&header.head, __ATOMIC_ACQUIRE);
+        // Clamp against torn/lagging reads so the subtraction stays ordered:
+        // completed <= doorbell <= head.
+        doorbell = std::max(doorbell, completed);
+        head = std::max(head, doorbell);
+
+        const uint64_t occupied =
+            std::min<uint64_t>(head - completed, geometry_.slots_per_lane);
+        stats.empty = geometry_.slots_per_lane - occupied;
+        stats.cuda_pending = static_cast<size_t>(head - doorbell);
+        stats.rdma_pending = static_cast<size_t>(doorbell - completed);
+    }
+    return result;
+}
+
 void RelayPipeline::complete(size_t lane_index, uint64_t sequence,
                              int32_t status) {
     auto& lane = control_->lanes[lane_index];
-    const size_t slot = *slotIndex(sequence);
+    const size_t slot = *slotIndex(sequence, geometry_.slots_per_lane);
     if (status == 0) {
         relayed_bytes_.fetch_add(lane.descriptors[slot].piece_length,
                                  std::memory_order_relaxed);
@@ -644,11 +825,11 @@ void PxnPump::runRelay() {
 Status makeRdmaRelayBackend(RdmaTransport& transport, uintptr_t arena_address,
                             std::span<const std::string> source_device_names,
                             std::span<const std::string> source_rails,
-                            size_t max_inflight,
+                            size_t max_inflight, PxnGeometry geometry,
                             std::unique_ptr<RelayBackend>& backend) {
     return RdmaRelayBackend::Create(transport, arena_address,
                                     source_device_names, source_rails,
-                                    max_inflight, backend);
+                                    max_inflight, geometry, backend);
 }
 
 }  // namespace pxn

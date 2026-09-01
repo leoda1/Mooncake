@@ -124,26 +124,32 @@ class RailResolver {
     std::unordered_map<std::string, std::string> rail_map_;
 };
 
-std::optional<size_t> slotIndex(uint64_t sequence);
-bool hasRingCredit(uint64_t next_sequence, uint64_t reaped_sequence);
+std::optional<size_t> slotIndex(uint64_t sequence,
+                                size_t slots_per_lane = kMaxSlotsPerLane);
+bool hasRingCredit(uint64_t next_sequence, uint64_t reaped_sequence,
+                   size_t slots_per_lane = kMaxSlotsPerLane);
 bool advanceSequence(uint64_t sequence, uint64_t& next_sequence);
 
 Status buildPieces(std::span<const TransferSpan> spans,
-                   std::vector<Piece>& pieces);
+                   std::vector<Piece>& pieces,
+                   size_t slot_size = kDefaultSlotSize);
 
 Status prepareDescriptor(const Piece& piece, std::string_view session,
                          uint64_t epoch, uint32_t rail_index,
-                         Descriptor& descriptor);
+                         Descriptor& descriptor,
+                         size_t slot_size = kDefaultSlotSize);
 inline Status prepareDescriptor(const Piece& piece, std::string_view session,
                                 uint64_t epoch, Descriptor& descriptor) {
-    return prepareDescriptor(piece, session, epoch, 0, descriptor);
+    return prepareDescriptor(piece, session, epoch, 0, descriptor,
+                             kDefaultSlotSize);
 }
 
 bool commitDescriptor(Descriptor& descriptor, uint64_t sequence);
 uint64_t loadDescriptorSequence(const Descriptor& descriptor);
 DescriptorError validateDescriptor(const Descriptor& descriptor,
                                    uint64_t expected_sequence,
-                                   uint64_t expected_epoch);
+                                   uint64_t expected_epoch,
+                                   size_t slot_size = kDefaultSlotSize);
 
 bool commitCompletion(Completion& completion, uint64_t sequence,
                       int32_t status);

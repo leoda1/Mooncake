@@ -98,13 +98,13 @@ struct alignas(64) LaneHeader {
 
 struct alignas(64) LaneControl {
     LaneHeader header;
-    Descriptor descriptors[kSlotsPerLane];
-    Completion completions[kSlotsPerLane];
+    Descriptor descriptors[kMaxSlotsPerLane];
+    Completion completions[kMaxSlotsPerLane];
 };
 
 struct alignas(64) ControlBlock {
     RegistryHeader header;
-    LaneControl lanes[kLaneCount];
+    LaneControl lanes[kMaxLaneCount];
 };
 
 static_assert(sizeof(ProcessIdentity) == 16);
@@ -213,7 +213,7 @@ class PeerMapping {
     std::mutex mutex_;
     ProcessIdentity sender_{};
     uint64_t sender_epoch_ = 0;
-    size_t lane_index_ = kLaneCount;
+    size_t lane_index_ = kMaxLaneCount;
     bool arena_attached_ = false;
 };
 
