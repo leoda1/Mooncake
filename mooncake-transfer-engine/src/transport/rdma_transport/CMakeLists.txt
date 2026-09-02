@@ -2,7 +2,7 @@ file(GLOB RDMA_SOURCES "*.cpp")
 
 add_library(rdma_transport OBJECT ${RDMA_SOURCES})
 target_link_libraries(rdma_transport PRIVATE JsonCpp::JsonCpp glog::glog
-                                             pthread)
+                                             pthread ${CMAKE_DL_LIBS})
 
 if(USE_MLX5DV)
   target_compile_definitions(rdma_transport PRIVATE USE_MLX5DV)

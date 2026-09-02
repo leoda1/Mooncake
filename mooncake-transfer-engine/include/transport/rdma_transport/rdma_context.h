@@ -99,6 +99,11 @@ struct DmabufExport {
     Method method = Method::kHostReg;
     int fd = -1;          // live dma_buf fd; -1 when not applicable
     uint64_t offset = 0;  // offset of addr within the exported allocation
+    // True when the fd was exported with CU_MEM_RANGE_FLAG_DMA_BUF_MAPPING_
+    // TYPE_PCIE for NVIDIA Data Direct. Registration must then go through
+    // mlx5dv_reg_dmabuf_mr() with the DATA_DIRECT provider flag; the two
+    // halves only work as a pair, so this travels with the fd.
+    bool data_direct = false;
 };
 
 // RdmaContext represents the set of resources controlled by each local NIC,

@@ -50,6 +50,7 @@ class Environ {
     bool GetIntraNvlink() const { return intra_nvlink_; }
     bool GetPathRoundrobin() const { return path_roundrobin_; }
     bool GetWithNvidiaPeermem() const { return with_nvidia_peermem_; }
+    bool GetUseDataDirect() const { return use_data_direct_; }
     int GetEfaCqThreads() const { return efa_cq_threads_; }
 
     // AWS / S3 client configuration
@@ -124,6 +125,7 @@ class Environ {
     bool intra_nvlink_;
     bool path_roundrobin_;
     bool with_nvidia_peermem_;
+    bool use_data_direct_;
     int efa_cq_threads_;
 
     // AWS / S3 client configuration

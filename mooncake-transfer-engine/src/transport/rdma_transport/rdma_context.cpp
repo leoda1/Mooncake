@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstdio>
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/epoll.h>
@@ -27,6 +28,7 @@
 #include <exception>
 #include <fstream>
 #include <memory>
+#include <mutex>
 #include <thread>
 
 #include "config.h"
@@ -57,6 +59,126 @@ static int isNullGid(union ibv_gid *gid) {
 }
 
 namespace {
+
+#if defined(USE_CUDA)
+// NVIDIA Data Direct (ConnectX-8 / BlueField-3 class NICs) lets the HCA reach
+// GPU memory over a dedicated PCIe path instead of the regular GPUDirect route.
+// This is what perftest exposes as --use_data_direct. It needs two pieces that
+// plain ibv_reg_dmabuf_mr() cannot express, and they only work as a pair:
+//
+//   1. The dma_buf fd must be exported with
+//      CU_MEM_RANGE_FLAG_DMA_BUF_MAPPING_TYPE_PCIE so CUDA maps it via PCIe
+//      BAR1.
+//   2. The MR must be registered through mlx5dv_reg_dmabuf_mr() with the
+//      MLX5DV_REG_DMABUF_ACCESS_DATA_DIRECT provider flag.
+//
+// mlx5dv_reg_dmabuf_mr() only exists in newer rdma-core (>= v55 / MLNX_OFED
+// >= 24.10) and the DATA_DIRECT flag lives in an mlx5-specific header older
+// distributions do not ship. Resolving the symbol via dlsym() keeps Mooncake
+// buildable against old headers while still using Data Direct whenever the
+// runtime libmlx5 provides it. Step 1 is rejected with CUDA error 801
+// (NOT_SUPPORTED) on some GPUs (e.g. B200), so both steps fall back to the
+// standard DMA-BUF path rather than failing registration.
+constexpr int kMlx5DvRegDmabufAccessDataDirect = 1 << 0;
+
+using Mlx5dvRegDmabufMrFn = struct ibv_mr *(*)(struct ibv_pd * pd,
+                                               uint64_t offset, size_t length,
+                                               uint64_t iova, int fd,
+                                               int access, int mlx5_access);
+
+// Resolved once; nullptr when the runtime libmlx5 predates Data Direct.
+Mlx5dvRegDmabufMrFn getMlx5dvRegDmabufMr() {
+    static Mlx5dvRegDmabufMrFn fn = []() -> Mlx5dvRegDmabufMrFn {
+        // RTLD_DEFAULT covers the libmlx5 that libibverbs already loaded as a
+        // provider, so no explicit dlopen is needed.
+        auto sym = dlsym(RTLD_DEFAULT, "mlx5dv_reg_dmabuf_mr");
+        if (!sym) {
+            LOG(WARNING)
+                << "MC_USE_DATA_DIRECT is set but mlx5dv_reg_dmabuf_mr is "
+                   "missing from the runtime libmlx5 (needs rdma-core >= v55 / "
+                   "MLNX_OFED >= 24.10); using standard DMA-BUF registration";
+        }
+        return reinterpret_cast<Mlx5dvRegDmabufMrFn>(sym);
+    }();
+    return fn;
+}
+
+// Data Direct needs both halves available before the fd is exported.
+//
+// Deliberately NOT latched on failure. An earlier version disabled Data Direct
+// process-wide after the first rejected registration, on the assumption that
+// the rejection was a host/NIC property. Production logs disproved that: Data
+// Direct came up on all four NICs, then one buffer whose address was not
+// page-aligned was rejected with EOPNOTSUPP and the latch tore down the
+// working configuration for every later buffer. Rejection is per-buffer, so
+// each buffer falls back on its own and the rest keep using Data Direct.
+bool dataDirectRequested() {
+    return Environ::Get().GetUseDataDirect() && getMlx5dvRegDmabufMr();
+}
+
+// Export a dma_buf fd covering `addr`. `range_flags` selects the mapping:
+// CU_MEM_RANGE_FLAG_DMA_BUF_MAPPING_TYPE_PCIE for Data Direct (PCIe BAR1), 0
+// for the regular GPUDirect mapping. A BAR1 fd is NOT accepted by the plain
+// ibv_reg_dmabuf_mr verb, so the fallback path must re-export with flags=0
+// rather than reuse the Data Direct fd.
+//
+// cuMemGetHandleForAddressRange requires the address and size to be aligned to
+// the host page size, which is 64 KiB on the GB300 kernels. The exported range
+// therefore starts at the page containing `addr` (clamped to the allocation
+// base) and *out_offset carries the distance from that page start to `addr`, in
+// the same way perftest does it.
+// Returns 0 on success and fills *out_fd / *out_offset; the caller owns the fd.
+int exportDmabufFdWithFlags(void *addr, unsigned long long range_flags,
+                            int *out_fd, uint64_t *out_offset) {
+    unsigned int devOrd = 0;
+    cuPointerGetAttribute(&devOrd, CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL,
+                          (CUdeviceptr)addr);
+    CUdevice cuDev;
+    CUcontext cuCtx;
+    cuDeviceGet(&cuDev, devOrd);
+    cuDevicePrimaryCtxRetain(&cuCtx, cuDev);
+    cuCtxSetCurrent(cuCtx);
+
+    CUdeviceptr allocBase;
+    size_t allocSize;
+    CUresult result =
+        cuMemGetAddressRange(&allocBase, &allocSize, (CUdeviceptr)addr);
+    if (result != CUDA_SUCCESS) {
+        const char *errStr;
+        cuGetErrorString(result, &errStr);
+        LOG(ERROR) << "cuMemGetAddressRange failed for " << addr
+                   << " cuda error=" << errStr;
+        cuDevicePrimaryCtxRelease(cuDev);
+        return -1;
+    }
+    // Align the exported range to the host page size. allocBase from
+    // cuMemGetAddressRange is normally already aligned, but a caller may hand
+    // us an address inside the allocation (PyTorch and sglang sub-allocate),
+    // and the offset that reaches the MR must start on a page boundary.
+    const size_t page_size = (size_t)sysconf(_SC_PAGESIZE);
+    uintptr_t page_base = (uintptr_t)addr & ~(uintptr_t)(page_size - 1);
+    if (page_base < (uintptr_t)allocBase) page_base = (uintptr_t)allocBase;
+    const uint64_t page_offset = (uintptr_t)addr - page_base;
+    // Keep the range inside the allocation; rounding past its end is rejected.
+    size_t range_size = allocSize - (page_base - (uintptr_t)allocBase);
+
+    int fd = -1;
+    result = cuMemGetHandleForAddressRange(
+        &fd, (CUdeviceptr)page_base, range_size,
+        CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, range_flags);
+    cuDevicePrimaryCtxRelease(cuDev);
+    if (result != CUDA_SUCCESS) {
+        const char *errStr;
+        cuGetErrorString(result, &errStr);
+        LOG(ERROR) << "cuMemGetHandleForAddressRange(flags=" << range_flags
+                   << ") failed for " << addr << " cuda error=" << errStr;
+        return -1;
+    }
+    *out_fd = fd;
+    *out_offset = page_offset;
+    return 0;
+}
+#endif  // USE_CUDA
 bool containsAddress(const MemoryRegionMeta &region, uintptr_t addr) {
     const auto region_start = reinterpret_cast<uintptr_t>(region.addr);
     const auto region_length = static_cast<uintptr_t>(region.mr->length);
@@ -439,11 +561,37 @@ int RdmaContext::exportDmabuf(void *addr, DmabufExport &out) {
         }
 
         int dmabuf_fd;
-        // flags must be 0: the PCIE-BAR1 mapping flag is rejected (error 801)
-        // on some GPU/driver combinations (e.g. B200).
+        // flags is normally 0: the PCIE-BAR1 mapping flag is rejected (error
+        // 801) on some GPU/driver combinations (e.g. B200). It is requested
+        // only when Data Direct is explicitly enabled, and the export is
+        // retried with flags=0 below if the platform refuses it.
+        bool want_data_direct = false;
+        unsigned long long range_flags = 0;
+#if defined(USE_CUDA)
+        want_data_direct = dataDirectRequested();
+        if (want_data_direct) {
+            range_flags = CU_MEM_RANGE_FLAG_DMA_BUF_MAPPING_TYPE_PCIE;
+        }
+#endif
         result = cuMemGetHandleForAddressRange(
             &dmabuf_fd, allocBase, allocSize,
-            CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0);
+            CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, range_flags);
+#if defined(USE_CUDA)
+        if (result != CUDA_SUCCESS && want_data_direct) {
+            // This platform cannot map the dma_buf through PCIe BAR1. Retry
+            // without the flag so registration still succeeds over the regular
+            // GPUDirect path instead of failing the transfer engine.
+            const char *ddErr;
+            cuGetErrorString(result, &ddErr);
+            LOG(WARNING) << "Data Direct dma_buf export failed (cuda error="
+                         << ddErr << "); falling back to standard DMA-BUF for "
+                         << (uintptr_t)addr;
+            want_data_direct = false;
+            result = cuMemGetHandleForAddressRange(
+                &dmabuf_fd, allocBase, allocSize,
+                CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0);
+        }
+#endif
         if (result != CUDA_SUCCESS) {
             const char *errStr;
             cuGetErrorString(result, &errStr);
@@ -458,6 +606,7 @@ int RdmaContext::exportDmabuf(void *addr, DmabufExport &out) {
         out.method = DmabufExport::Method::kDmabufReg;
         out.fd = dmabuf_fd;
         out.offset = (uintptr_t)addr - (uintptr_t)allocBase;
+        out.data_direct = want_data_direct;
 #if defined(USE_CUDA)
         cuDevicePrimaryCtxRelease(cuDev);
 #endif
@@ -575,8 +724,76 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
         // by the caller until every NIC has registered; this MR takes its own
         // reference, so all NICs share one dma_buf object (and one BAR1
         // window).
-        mrMeta.mr = ibv_reg_dmabuf_mr(pd_, exp.offset, length, (uintptr_t)addr,
-                                      exp.fd, access);
+        mrMeta.mr = nullptr;
+#if defined(USE_CUDA)
+        if (exp.data_direct) {
+            // The fd was exported via PCIe BAR1, so it must be registered with
+            // the DATA_DIRECT provider flag to actually use the Data Direct
+            // path. getMlx5dvRegDmabufMr() is non-null here because
+            // dataDirectRequested() gated the export.
+            auto reg_fn = getMlx5dvRegDmabufMr();
+            if (reg_fn) {
+                mrMeta.mr =
+                    reg_fn(pd_, exp.offset, length, (uintptr_t)addr, exp.fd,
+                           access, kMlx5DvRegDmabufAccessDataDirect);
+                if (mrMeta.mr) {
+                    static std::once_flag ddLogged;
+                    std::call_once(ddLogged, [this]() {
+                        LOG(INFO)
+                            << "[RDMA] NVIDIA Data Direct enabled for GPU "
+                               "memory registration on "
+                            << device_name_;
+                    });
+                } else {
+                    // Per-buffer fallback only. Typically EOPNOTSUPP for a
+                    // buffer the driver will not map through the Data Direct
+                    // engine (an unaligned sub-allocation, say); other buffers
+                    // are unaffected and keep using Data Direct. Logged once
+                    // per process so a hot registration path cannot flood.
+                    static std::once_flag ddFallbackLogged;
+                    std::call_once(ddFallbackLogged, [addr]() {
+                        PLOG(WARNING)
+                            << "mlx5dv_reg_dmabuf_mr with DATA_DIRECT failed "
+                               "for "
+                            << addr
+                            << "; this buffer falls back to standard DMA-BUF "
+                               "registration (Data Direct stays enabled for "
+                               "other buffers; further occurrences silent)";
+                    });
+                }
+            }
+        }
+#endif
+        if (!mrMeta.mr) {
+#if defined(USE_CUDA)
+            if (exp.data_direct) {
+                // The shared fd was exported through PCIe BAR1 for Data Direct,
+                // and the plain verb below rejects such an fd. Re-export the
+                // same allocation with flags=0 and register that instead. The
+                // local fd is owned here (the caller only closes exp.fd), so it
+                // is closed as soon as the MR holds its own reference.
+                int fallback_fd = -1;
+                uint64_t fallback_offset = 0;
+                if (exportDmabufFdWithFlags(addr, 0, &fallback_fd,
+                                            &fallback_offset) == 0) {
+                    mrMeta.mr =
+                        ibv_reg_dmabuf_mr(pd_, fallback_offset, length,
+                                          (uintptr_t)addr, fallback_fd, access);
+                    const int regErrno = errno;
+                    if (close(fallback_fd) != 0) {
+                        PLOG(WARNING) << "Failed to close fallback dmabuf fd";
+                    }
+                    if (!mrMeta.mr) errno = regErrno;
+                }
+            } else {
+                mrMeta.mr = ibv_reg_dmabuf_mr(pd_, exp.offset, length,
+                                              (uintptr_t)addr, exp.fd, access);
+            }
+#else
+            mrMeta.mr = ibv_reg_dmabuf_mr(pd_, exp.offset, length,
+                                          (uintptr_t)addr, exp.fd, access);
+#endif
+        }
     } else {
         mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);
     }
