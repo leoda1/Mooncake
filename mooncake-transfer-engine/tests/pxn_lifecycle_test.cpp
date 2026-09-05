@@ -114,13 +114,15 @@ class TemporaryDirectory {
 };
 
 RegistryOptions registryOptions(const TemporaryDirectory& directory,
-                                int32_t pid, uint64_t epoch) {
+                                int32_t pid, uint64_t epoch,
+                                int32_t local_rank_index = 0) {
     RegistryOptions options;
     options.root_directory = directory.path();
     options.group_id = "job";
     options.identity = ProcessIdentity{static_cast<uint32_t>(geteuid()), pid,
                                        static_cast<uint64_t>(pid)};
     options.epoch = epoch;
+    options.local_rank_index = local_rank_index;
     options.process_probe = [](const ProcessIdentity&) {
         return std::optional<bool>(true);
     };
@@ -159,18 +161,19 @@ TEST(PxnLifecycleTest, MapsPeerLaneAndHoldsArenaLease) {
 
     std::unique_ptr<LocalResources> relay;
     ASSERT_TRUE(LocalResources::Create(
-                    registryOptions(directory, 1001, 11), hcas, {},
+                    registryOptions(directory, 1001, 11, 3), hcas, {},
                     std::make_unique<FakeBackend>(relay_state), relay)
                     .ok());
     std::unique_ptr<LocalResources> sender;
     ASSERT_TRUE(LocalResources::Create(
-                    registryOptions(directory, 1002, 22), hcas, {},
+                    registryOptions(directory, 1002, 22, 5), hcas, {},
                     std::make_unique<FakeBackend>(sender_state), sender)
                     .ok());
 
     std::vector<RegistryEntry> peers;
     ASSERT_TRUE(sender->registry().discover(peers).ok());
     ASSERT_EQ(peers.size(), 1u);
+    EXPECT_EQ(peers.front().local_rank_index, 3);
     PeerResources* peer = nullptr;
     ASSERT_TRUE(sender->mapPeer(peers.front(), peer).ok());
     ASSERT_NE(peer, nullptr);
@@ -241,15 +244,16 @@ TEST(PxnLifecycleTest, RegistryPublishesRuntimeGeometry) {
     const std::array<std::string, 1> hcas{"mlx5_0"};
 
     std::unique_ptr<LocalResources> resources;
-    ASSERT_TRUE(
-        LocalResources::Create(registryOptions(directory, 1003, 33), hcas, {},
-                               std::make_unique<FakeBackend>(state), resources)
-            .ok());
+    ASSERT_TRUE(LocalResources::Create(
+                    registryOptions(directory, 1003, 33, 7), hcas, {},
+                    std::make_unique<FakeBackend>(state), resources)
+                    .ok());
     const auto& header = resources->registration().control()->header;
     EXPECT_EQ(header.lane_count, geometry.lane_count);
     EXPECT_EQ(header.slots_per_lane, geometry.slots_per_lane);
     EXPECT_EQ(header.slot_size, geometry.slot_size);
     EXPECT_EQ(header.arena_size, geometry.arenaSize());
+    EXPECT_EQ(header.local_rank_index, 7);
     EXPECT_TRUE(resources->shutdown().ok());
 }
 

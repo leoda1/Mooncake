@@ -34,9 +34,12 @@ namespace pxn {
 namespace {
 
 static_assert(sizeof(cudaIpcMemHandle_t) == kCudaIpcHandleSize);
-#if CUDA_VERSION >= 11070
+#if CUDA_VERSION >= 12030
 constexpr CUdevice_attribute kCanUseStreamMemOpsAttribute =
-    CU_DEVICE_ATTRIBUTE_CAN_USE_STREAM_MEM_OPS_V1;
+    CU_DEVICE_ATTRIBUTE_CAN_USE_64_BIT_STREAM_MEM_OPS;
+#elif CUDA_VERSION >= 11070
+constexpr CUdevice_attribute kCanUseStreamMemOpsAttribute =
+    CU_DEVICE_ATTRIBUTE_CAN_USE_64_BIT_STREAM_MEM_OPS_V1;
 #else
 constexpr CUdevice_attribute kCanUseStreamMemOpsAttribute =
     CU_DEVICE_ATTRIBUTE_CAN_USE_STREAM_MEM_OPS;
@@ -92,34 +95,44 @@ class CudaDeviceScope {
     Status status_;
 };
 
-class CudaEventPool {
+class CudaEventRing {
    public:
-    explicit CudaEventPool(int device_id) : device_id_(device_id) {}
+    explicit CudaEventRing(int device_id) : device_id_(device_id) {}
 
-    ~CudaEventPool() {
+    ~CudaEventRing() {
         CudaDeviceScope device(device_id_);
         if (!device.status().ok()) return;
-        for (auto event : events_) (void)cudaEventDestroy(event);
-    }
-
-    cudaError_t acquire(cudaEvent_t& event) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (events_.empty()) {
-            return cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
+        for (auto event : events_) {
+            if (event != nullptr) (void)cudaEventDestroy(event);
         }
-        event = events_.back();
-        events_.pop_back();
-        return cudaSuccess;
     }
 
-    void release(cudaEvent_t event) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        events_.push_back(event);
+    Status initialize(size_t count) {
+        CudaDeviceScope device(device_id_);
+        if (!device.status().ok()) return device.status();
+        events_.assign(count, nullptr);
+        for (size_t index = 0; index < count; ++index) {
+            auto error = cudaEventCreateWithFlags(&events_[index],
+                                                  cudaEventDisableTiming);
+            if (error != cudaSuccess) {
+                return cudaError("cudaEventCreateWithFlags failed", error);
+            }
+        }
+        return Status::OK();
     }
+
+    cudaEvent_t next() {
+        if (events_.empty()) return nullptr;
+        cudaEvent_t event = events_[cursor_];
+        cursor_ = (cursor_ + 1 == events_.size()) ? 0 : cursor_ + 1;
+        return event;
+    }
+
+    size_t size() const { return events_.size(); }
 
    private:
     int device_id_;
-    std::mutex mutex_;
+    size_t cursor_ = 0;
     std::vector<cudaEvent_t> events_;
 };
 
@@ -217,20 +230,13 @@ class CudaRdmaStagingBackend final : public StagingBackend {
 
 class CudaReadyFence final : public SenderReadyFence {
    public:
-    CudaReadyFence(std::shared_ptr<CudaEventPool> pool, cudaEvent_t event)
-        : pool_(std::move(pool)), event_(event) {}
-
-    ~CudaReadyFence() override {
-        if (event_ == nullptr) return;
-        // cudaStreamWaitEvent captures the record state before this reuse.
-        pool_->release(event_);
-    }
+    explicit CudaReadyFence(cudaEvent_t event) : event_(event) {}
 
     cudaEvent_t event() const { return event_; }
+    void reset(cudaEvent_t event) { event_ = event; }
 
    private:
-    std::shared_ptr<CudaEventPool> pool_;
-    cudaEvent_t event_;
+    cudaEvent_t event_ = nullptr;
 };
 
 class CudaSenderLaneHandle final : public SenderLaneHandle {
@@ -265,8 +271,7 @@ class CudaSenderLaneHandle final : public SenderLaneHandle {
 class CudaSenderBackend final : public SenderBackend {
    public:
     explicit CudaSenderBackend(int device_id)
-        : device_id_(device_id),
-          event_pool_(std::make_shared<CudaEventPool>(device_id)) {}
+        : device_id_(device_id), event_ring_(device_id) {}
 
     Status bindThread() override {
         auto error = cudaSetDevice(device_id_);
@@ -309,6 +314,11 @@ class CudaSenderBackend final : public SenderBackend {
             return cudaError("cudaStreamCreateWithFlags failed", error);
         }
 
+        if (event_ring_.size() < endpoint.geometry.slots_per_lane) {
+            auto status = event_ring_.initialize(endpoint.geometry.slots_per_lane);
+            if (!status.ok()) return status;
+        }
+
         int stream_mem_ops = 0;
         CUdevice cuda_device;
         if (cuDeviceGet(&cuda_device, device_id_) == CUDA_SUCCESS &&
@@ -336,28 +346,27 @@ class CudaSenderBackend final : public SenderBackend {
     Status recordReady(std::unique_ptr<SenderReadyFence>& fence) override {
         CudaDeviceScope device(device_id_);
         if (!device.status().ok()) return device.status();
-        cudaEvent_t event = nullptr;
-        auto error = event_pool_->acquire(event);
+        auto* existing = static_cast<CudaReadyFence*>(fence.get());
+        cudaEvent_t event = event_ring_.next();
+        auto error = cudaEventRecord(event, cudaStreamPerThread);
         if (error != cudaSuccess) {
-            return cudaError("acquire CUDA ready event failed", error);
-        }
-        error = cudaEventRecord(event, cudaStreamPerThread);
-        if (error != cudaSuccess) {
-            (void)cudaEventDestroy(event);
             error = cudaStreamSynchronize(cudaStreamPerThread);
             if (error != cudaSuccess) {
                 return cudaError("cudaStreamSynchronize failed", error);
             }
-            fence = std::make_unique<CudaReadyFence>(event_pool_, nullptr);
-            return Status::OK();
+            event = nullptr;  // already synchronized; no wait needed
         }
-        fence = std::make_unique<CudaReadyFence>(event_pool_, event);
+        if (existing != nullptr) {
+            existing->reset(event);
+        } else {
+            fence = std::make_unique<CudaReadyFence>(event);
+        }
         return Status::OK();
     }
 
     Status queryReady(const SenderReadyFence& fence, bool& ready) override {
         ready = false;
-        auto* cuda_fence = dynamic_cast<const CudaReadyFence*>(&fence);
+        const auto* cuda_fence = static_cast<const CudaReadyFence*>(&fence);
         if (cuda_fence == nullptr) {
             return Status::InvalidArgument("invalid PXN ready event");
         }
@@ -380,11 +389,12 @@ class CudaSenderBackend final : public SenderBackend {
                    const std::vector<SenderCopy>& copies, uint64_t sequence,
                    SenderPublishState& state) override {
         PXN_NVTX_SENDER("pxn::sender::publish");
-        auto* lane = dynamic_cast<CudaSenderLaneHandle*>(&handle);
-        auto* ready = dynamic_cast<const CudaReadyFence*>(&fence);
+        auto* lane = static_cast<CudaSenderLaneHandle*>(&handle);
+        const auto* ready = static_cast<const CudaReadyFence*>(&fence);
         if (lane == nullptr || ready == nullptr || copies.empty()) {
             return Status::InvalidArgument("invalid PXN CUDA sender state");
         }
+        warnOnForeignSourceDevice(copies.front().source);
         CudaDeviceScope device(device_id_);
         if (!device.status().ok()) return device.status();
 
@@ -396,9 +406,12 @@ class CudaSenderBackend final : public SenderBackend {
             }
         }
 
-        std::vector<void*> sources;
-        std::vector<void*> destinations;
-        std::vector<size_t> sizes;
+        auto& sources = scratch_sources_;
+        auto& destinations = scratch_destinations_;
+        auto& sizes = scratch_sizes_;
+        sources.clear();
+        destinations.clear();
+        sizes.clear();
         sources.reserve(copies.size());
         destinations.reserve(copies.size());
         sizes.reserve(copies.size());
@@ -412,7 +425,7 @@ class CudaSenderBackend final : public SenderBackend {
         cudaMemcpyAttributes attributes{};
         attributes.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
         size_t attribute_index = 0;
-        std::vector<size_t> mutable_sizes(sizes);
+        auto& mutable_sizes = sizes;
 #if CUDART_VERSION >= 13000
         error = cudaMemcpyBatchAsync(
             const_cast<const void**>(destinations.data()),
@@ -461,7 +474,7 @@ class CudaSenderBackend final : public SenderBackend {
 
     Status pollCpuDoorbell(SenderLaneHandle& handle, bool& ready) override {
         ready = false;
-        auto* lane = dynamic_cast<CudaSenderLaneHandle*>(&handle);
+        auto* lane = static_cast<CudaSenderLaneHandle*>(&handle);
         if (lane == nullptr || lane->publish_event_ == nullptr) {
             return Status::InvalidArgument("invalid PXN publish event");
         }
@@ -477,8 +490,37 @@ class CudaSenderBackend final : public SenderBackend {
     }
 
    private:
+    void warnOnForeignSourceDevice(uintptr_t source) {
+        if (source_device_checked_) return;
+        source_device_checked_ = true;
+        cudaPointerAttributes attributes{};
+        auto error = cudaPointerGetAttributes(&attributes,
+                                              reinterpret_cast<void*>(source));
+        if (error != cudaSuccess) {
+            // Not a CUDA pointer, or attributes unavailable; nothing to say.
+            (void)cudaGetLastError();
+            return;
+        }
+        if (attributes.type != cudaMemoryTypeDevice ||
+            attributes.device == device_id_) {
+            return;
+        }
+        LOG(WARNING) << "PXN staging copies are bouncing through host memory: "
+                        "the sender is bound to cuda:"
+                     << device_id_ << " but the source buffer lives on cuda:"
+                     << attributes.device
+                     << ". The PXN transport captures its device with "
+                        "cudaGetDevice() at install time, so select the GPU "
+                        "(cudaSetDevice) before creating the TransferEngine to "
+                        "keep staging on NVLink.";
+    }
+
     int device_id_;
-    std::shared_ptr<CudaEventPool> event_pool_;
+    bool source_device_checked_ = false;
+    CudaEventRing event_ring_;
+    std::vector<void*> scratch_sources_;
+    std::vector<void*> scratch_destinations_;
+    std::vector<size_t> scratch_sizes_;
 };
 
 }  // namespace

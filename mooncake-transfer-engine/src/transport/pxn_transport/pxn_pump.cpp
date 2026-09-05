@@ -18,7 +18,9 @@
 #include <atomic>
 #include <limits>
 #include <memory>
+#include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 
@@ -702,6 +704,23 @@ void RelayPipeline::shutdown() {
     inflight_count_ = 0;
 }
 
+bool RelayPipeline::hasActiveLane() const {
+    for (size_t index = 0; index < geometry_.lane_count; ++index) {
+        const auto& header = control_->lanes[index].header;
+        if (loadLaneState(header) !=
+            static_cast<uint32_t>(LaneState::kReady)) {
+            continue;
+        }
+        // head moves as soon as the sender publishes, well before the doorbell
+        // is visible, so this catches the CUDA-copy window too.
+        const uint64_t completed =
+            __atomic_load_n(&header.completed, __ATOMIC_ACQUIRE);
+        const uint64_t head = __atomic_load_n(&header.head, __ATOMIC_ACQUIRE);
+        if (head > completed) return true;
+    }
+    return false;
+}
+
 RelayPipeline::InflightStats RelayPipeline::inflightStats() const {
     return {inflight_count_,
             max_inflight_,
@@ -792,9 +811,50 @@ void PxnPump::runSender() {
         }
         made_progress = made_progress || progress;
 
+        if (made_progress && ++sender_report_ % 20000 == 0) {
+            const auto s = sender_.supplyStats();
+            const auto cursors = sender_.cursorStats();
+            std::string cursor_log;
+            uint64_t cuda_pending_total = 0;
+            uint64_t rdma_pending_total = 0;
+            for (size_t index = 0; index < cursors.size(); ++index) {
+                const auto& c = cursors[index];
+                if (!c.active) continue;
+                cuda_pending_total += c.cuda_pending;
+                rdma_pending_total += c.rdma_pending;
+                if (!cursor_log.empty()) cursor_log += ' ';
+                cursor_log += "L" + std::to_string(index) +
+                              ":h=" + std::to_string(c.head) +
+                              ",d=" + std::to_string(c.doorbell) +
+                              ",c=" + std::to_string(c.completed) +
+                              ",cuda=" + std::to_string(c.cuda_pending) +
+                              ",rdma=" + std::to_string(c.rdma_pending) +
+                              ",tot=" + std::to_string(c.total_pending) + "/" +
+                              std::to_string(c.slots_per_lane);
+            }
+            LOG(INFO) << "PXN sender supply: passes=" << s.passes
+                      << " published=" << s.published << " avg_pub_x100="
+                      << (s.passes == 0 ? 0 : s.published * 100 / s.passes)
+                      << " pub_hwm=" << s.published_hwm << " avg_qdepth_x100="
+                      << (s.passes == 0 ? 0
+                                        : s.queue_depth_sum * 100 / s.passes)
+                      << " qdepth_hwm=" << s.queue_depth_hwm
+                      << " | stop: qempty=" << s.stops[1]
+                      << " nocredit=" << s.stops[2]
+                      << " doorbell=" << s.stops[3] << " fbq=" << s.stops[4]
+                      << " none=" << s.stops[0]
+                      << " | cuda_pending=" << cuda_pending_total
+                      << " rdma_pending=" << rdma_pending_total << " cursors=["
+                      << cursor_log << "]";
+        }
+
         if (!made_progress && !sender_.hasInflight()) {
-            std::unique_lock<std::mutex> lock(sender_mutex_);
-            sender_condition_.wait_for(lock, std::chrono::microseconds(50));
+            if (sender_.hasQueuedWork()) {
+                std::this_thread::yield();
+            } else {
+                std::unique_lock<std::mutex> lock(sender_mutex_);
+                sender_condition_.wait_for(lock, std::chrono::microseconds(50));
+            }
         }
     }
 }
@@ -815,9 +875,55 @@ void PxnPump::runRelay() {
         }
         made_progress = made_progress || progress;
 
+        if (made_progress && ++relay_report_ % 20000 == 0) {
+            const auto stats = relay_.inflightStats();
+            const auto slots = relay_.laneSlotStats();
+            size_t cuda_pending = 0;
+            size_t rdma_pending = 0;
+            for (const auto& slot : slots) {
+                if (!slot.active) continue;
+                cuda_pending += slot.cuda_pending;
+                rdma_pending += slot.rdma_pending;
+            }
+            std::string cursors;
+            for (size_t i = 0; i < relay_.geometryForLog().lane_count; ++i) {
+                const auto& h = relay_.laneHeaderForLog(i);
+                if (loadLaneState(h) !=
+                    static_cast<uint32_t>(LaneState::kReady)) {
+                    continue;
+                }
+                if (!cursors.empty()) cursors += ' ';
+                cursors += "L" + std::to_string(i) + ":h=" +
+                           std::to_string(__atomic_load_n(&h.head,
+                                                          __ATOMIC_ACQUIRE)) +
+                           ",d=" +
+                           std::to_string(__atomic_load_n(&h.doorbell,
+                                                          __ATOMIC_ACQUIRE)) +
+                           ",c=" +
+                           std::to_string(__atomic_load_n(&h.completed,
+                                                          __ATOMIC_ACQUIRE));
+            }
+            LOG(INFO) << "PXN relay depth: inflight=" << stats.current << "/"
+                      << stats.limit << " hwm=" << stats.high_watermark
+                      << " cursors=[" << cursors << "]"
+                      << " avg_batch_x100="
+                      << (stats.submit_batches == 0
+                              ? 0
+                              : stats.submitted_batch_slots * 100 /
+                                    stats.submit_batches)
+                      << " batch_hwm=" << stats.submit_batch_high_watermark
+                      << " limit_blocked=" << stats.limit_blocked_pieces
+                      << " | cuda_pending=" << cuda_pending
+                      << " rdma_pending=" << rdma_pending;
+        }
+
         if (!made_progress && !relay_.hasInflight()) {
-            std::unique_lock<std::mutex> lock(relay_mutex_);
-            relay_condition_.wait_for(lock, std::chrono::microseconds(50));
+            if (relay_.hasActiveLane()) {
+                std::this_thread::yield();
+            } else {
+                std::unique_lock<std::mutex> lock(relay_mutex_);
+                relay_condition_.wait_for(lock, std::chrono::microseconds(50));
+            }
         }
     }
 }

@@ -18,8 +18,10 @@
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <limits>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -58,6 +60,21 @@ bool covers(uint64_t begin, uint64_t end, uint64_t address, size_t length) {
            length <= end - begin && address - begin <= end - begin - length;
 }
 
+std::optional<int32_t> parseCudaRankIndex(std::string_view location) {
+    constexpr std::string_view prefix = "cuda:";
+    if (!location.starts_with(prefix)) return std::nullopt;
+
+    location.remove_prefix(prefix.size());
+    int32_t index = -1;
+    const auto [end, error] = std::from_chars(
+        location.data(), location.data() + location.size(), index);
+    if (error != std::errc() || end != location.data() + location.size() ||
+        index < 0) {
+        return std::nullopt;
+    }
+    return index;
+}
+
 std::vector<std::string> canonicalRails(const Topology& topology,
                                         std::string_view location,
                                         const pxn::RailResolver& resolver) {
@@ -93,6 +110,7 @@ struct PxnRdmaTransport::SelectionContext {
         uint64_t end = 0;
         std::string rail;
         bool same_rail = false;
+        int32_t rank_index = -1;
     };
 
     struct TargetEntry {
@@ -161,6 +179,7 @@ int PxnRdmaTransport::install(std::string& local_server_name,
     }
 
     const std::string location = "cuda:" + std::to_string(device_id);
+    local_rank_index_ = device_id;
     bool preferred_resolved = active_hcas.size() == 1;
     if (active_hcas.size() > 1 && pxn_topology != nullptr) {
         const auto matrix = pxn_topology->getMatrix();
@@ -209,6 +228,7 @@ int PxnRdmaTransport::install(std::string& local_server_name,
               << local_rail_log << "]";
     pxn::RegistryOptions registry_options;
     registry_options.group_id = globalConfig().pxn_group_id;
+    registry_options.local_rank_index = local_rank_index_;
     auto backend = pxn::makeCudaRdmaStagingBackend(*this, device_id);
     auto status = pxn::LocalResources::Create(
         std::move(registry_options), active_hcas, globalConfig().pxn_rail_map,
@@ -252,6 +272,9 @@ Status PxnRdmaTransport::submitTransferTask(
     struct Group {
         pxn::SenderLane* lane;
         uint32_t rail_index;
+        int32_t source_rank_index;
+        int32_t relay_rank_index;
+        int32_t destination_rank_index;
         SegmentID target_id;
         std::string session;
         std::vector<TransferTask*> tasks;
@@ -269,22 +292,34 @@ Status PxnRdmaTransport::submitTransferTask(
         std::string session;
         pxn::SenderLane* lane = nullptr;
         uint32_t rail_index = 0;
+        int32_t source_rank_index = -1;
+        int32_t relay_rank_index = -1;
+        int32_t destination_rank_index = -1;
         const auto& request = *task->request;
-        if (!selectPxnLane(request, selection, session, lane, rail_index)) {
+        if (!selectPxnLane(request, selection, session, lane, rail_index,
+                           source_rank_index, relay_rank_index,
+                           destination_rank_index)) {
             direct_tasks.push_back(task);
             continue;
         }
 
         size_t index = 0;
-        while (index < groups.size() &&
-               (groups[index].target_id != request.target_id ||
-                groups[index].lane != lane ||
-                groups[index].rail_index != rail_index)) {
+        while (
+            index < groups.size() &&
+            (groups[index].target_id != request.target_id ||
+             groups[index].lane != lane ||
+             groups[index].rail_index != rail_index ||
+             groups[index].source_rank_index != source_rank_index ||
+             groups[index].relay_rank_index != relay_rank_index ||
+             groups[index].destination_rank_index != destination_rank_index)) {
             ++index;
         }
         if (index == groups.size()) {
             groups.push_back({lane,
                               rail_index,
+                              source_rank_index,
+                              relay_rank_index,
+                              destination_rank_index,
                               request.target_id,
                               std::move(session),
                               {},
@@ -307,6 +342,24 @@ Status PxnRdmaTransport::submitTransferTask(
             direct_tasks.insert(direct_tasks.end(), group.tasks.begin(),
                                 group.tasks.end());
             continue;
+        }
+
+        uint64_t group_bytes = 0;
+        for (const auto& span : group.spans) group_bytes += span.length;
+        LOG(INFO) << "PXN rank route: src_rank_index="
+                  << group.source_rank_index
+                  << " relay_rank_index=" << group.relay_rank_index
+                  << " dst_rank_index=" << group.destination_rank_index
+                  << " session=" << group.session
+                  << " blocks=" << group.spans.size()
+                  << " bytes=" << group_bytes;
+        if (group.relay_rank_index >= 0 && group.destination_rank_index >= 0 &&
+            group.relay_rank_index != group.destination_rank_index) {
+            LOG(WARNING) << "PXN relay/destination local rank mismatch: "
+                         << "relay_rank_index=" << group.relay_rank_index
+                         << " dst_rank_index=" << group.destination_rank_index
+                         << " src_rank_index=" << group.source_rank_index
+                         << " session=" << group.session;
         }
 
         for (auto& piece : pieces) {
@@ -410,11 +463,12 @@ Status PxnRdmaTransport::submitTransferTask(
     return result;
 }
 
-bool PxnRdmaTransport::selectPxnLane(const TransferRequest& request,
-                                     SelectionContext& context,
-                                     std::string& session,
-                                     pxn::SenderLane*& lane,
-                                     uint32_t& rail_index) {
+bool PxnRdmaTransport::selectPxnLane(
+    const TransferRequest& request, SelectionContext& context,
+    std::string& session, pxn::SenderLane*& lane, uint32_t& rail_index,
+    int32_t& source_rank_index, int32_t& relay_rank_index,
+    int32_t& destination_rank_index) {
+    source_rank_index = local_rank_index_;
     if (request.opcode != TransferRequest::WRITE || request.length == 0) {
         ++context.not_write;
         return false;
@@ -471,6 +525,8 @@ bool PxnRdmaTransport::selectPxnLane(const TransferRequest& request,
                 ? resolveSegmentsLocation(segments, buffer.length,
                                           request.target_offset - buffer.addr)
                 : buffer.name;
+        const int32_t target_rank_index =
+            parseCudaRankIndex(location).value_or(-1);
         const std::string target_rail =
             rail_resolver_->canonicalize(target->devices[device_id].name);
         const bool cacheable =
@@ -481,7 +537,8 @@ bool PxnRdmaTransport::selectPxnLane(const TransferRequest& request,
             route_end = buffer.addr + buffer.length;
         }
         transient_route = {route_begin, route_end, target_rail,
-                           resources_->ownsRail(target_rail)};
+                           resources_->ownsRail(target_rail),
+                           target_rank_index};
         if (cacheable) {
             auto rails =
                 canonicalRails(target->topology, location, *rail_resolver_);
@@ -497,8 +554,9 @@ bool PxnRdmaTransport::selectPxnLane(const TransferRequest& request,
             route_set.end = route_end;
             route_set.routes.reserve(rails.size());
             for (auto& rail : rails) {
-                route_set.routes.push_back(
-                    {route_begin, route_end, rail, resources_->ownsRail(rail)});
+                route_set.routes.push_back({route_begin, route_end, rail,
+                                            resources_->ownsRail(rail),
+                                            target_rank_index});
             }
             route_set.next = route_set.routes.size() > 1 ? 1 : 0;
             target_entry.route_sets.push_back(std::move(route_set));
@@ -557,6 +615,8 @@ bool PxnRdmaTransport::selectPxnLane(const TransferRequest& request,
         }
         lane = resolved->second.lane;
         rail_index = resolved->second.rail_index;
+        relay_rank_index = resolved->second.local_rank_index;
+        destination_rank_index = target_route->rank_index;
         session = target->name;
         return true;
     }
@@ -566,6 +626,8 @@ bool PxnRdmaTransport::selectPxnLane(const TransferRequest& request,
     if (cached != lanes_by_rail_.end()) {
         lane = cached->second.lane;
         rail_index = cached->second.rail_index;
+        relay_rank_index = cached->second.local_rank_index;
+        destination_rank_index = target_route->rank_index;
         context.relays[target_route->rail] = cached->second;
         session = target->name;
         return true;
@@ -587,11 +649,14 @@ bool PxnRdmaTransport::selectPxnLane(const TransferRequest& request,
         if (!resources_->mapPeer(entry, peer).ok()) return false;
         if (!sender_pipeline_->addPeer(*peer, lane).ok()) return false;
         for (size_t index = 0; index < entry.rails.size(); ++index) {
-            lanes_by_rail_[entry.rails[index]] = {lane,
-                                                  static_cast<uint32_t>(index)};
+            lanes_by_rail_[entry.rails[index]] = {
+                lane, static_cast<uint32_t>(index), entry.local_rank_index};
         }
         rail_index = static_cast<uint32_t>(rail - entry.rails.begin());
-        context.relays[target_route->rail] = {lane, rail_index};
+        relay_rank_index = entry.local_rank_index;
+        destination_rank_index = target_route->rank_index;
+        context.relays[target_route->rail] = {lane, rail_index,
+                                              relay_rank_index};
         session = target->name;
         return true;
     }

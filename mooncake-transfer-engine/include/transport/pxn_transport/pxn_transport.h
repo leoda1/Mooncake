@@ -279,6 +279,40 @@ class SenderLane {
                          std::chrono::milliseconds credit_timeout,
                          std::unique_ptr<SenderLane>& lane);
 
+    enum class StopReason : size_t {
+        kNone = 0,
+        kQueueEmpty = 1,
+        kNoCredit = 2,
+        kPendingDoorbell = 3,
+        kFallbackQueue = 4,
+        kCount = 5,
+    };
+
+    struct SupplyStats {
+        uint64_t passes;
+        uint64_t published;
+        uint64_t queue_depth_sum;
+        size_t published_hwm;
+        size_t queue_depth_hwm;
+        std::array<uint64_t, static_cast<size_t>(StopReason::kCount)> stops;
+    };
+    SupplyStats supplyStats() const {
+        return {progress_passes_,  published_total_, queue_depth_total_,
+                published_hwm_,    queue_depth_hwm_, stop_reason_};
+    }
+
+    struct CursorStats {
+        bool active;
+        uint64_t head;
+        uint64_t doorbell;
+        uint64_t completed;
+        uint64_t cuda_pending;  // head - doorbell
+        uint64_t rdma_pending;  // doorbell - completed
+        uint64_t total_pending;  // head - completed
+        size_t slots_per_lane;
+    };
+    CursorStats cursorStats() const;
+
     Status enqueue(SenderSubmission submission);
     Status reap(bool& made_progress);
     Status progress(bool& made_progress);
@@ -290,6 +324,11 @@ class SenderLane {
     bool quarantined() const { return quarantine_.quarantined(); }
     uint64_t fallbackBytes() const {
         return fallback_bytes_.load(std::memory_order_relaxed);
+    }
+
+    size_t queuedCount() {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        return queue_.size();
     }
 
    private:
@@ -315,6 +354,8 @@ class SenderLane {
     Status progressFallbackQueue(bool& made_progress);
     Status pollFallbacks(bool& made_progress);
     Status progressOne(bool& made_progress);
+    Status progressOne(bool& made_progress, bool& published,
+                       StopReason& reason);
     Status publish(QueuedSubmission submission, uint64_t sequence,
                    SenderPublishState& state, bool& quarantine_lane);
     void finishPublication(QueuedSubmission submission, uint64_t sequence,
@@ -339,6 +380,13 @@ class SenderLane {
     std::atomic<uint64_t> fallback_bytes_{0};
     AtomicQuarantineLatch quarantine_;
     bool shutdown_ = false;
+    std::vector<SenderCopy> publish_copies_;
+    uint64_t progress_passes_ = 0;
+    uint64_t published_total_ = 0;
+    uint64_t queue_depth_total_ = 0;
+    size_t published_hwm_ = 0;
+    size_t queue_depth_hwm_ = 0;
+    std::array<uint64_t, static_cast<size_t>(StopReason::kCount)> stop_reason_{};
 };
 
 class SenderPipeline {
@@ -356,10 +404,16 @@ class SenderPipeline {
     Status reapOutbound(bool& made_progress);
     Status progressOutbound(bool& made_progress);
     bool hasInflight() const { return has_inflight_; }
+    bool hasQueuedWork();
     Status shutdown();
 
     // Sum of every lane's fallback byte counter.
     uint64_t fallbackBytes();
+
+    SenderLane::SupplyStats supplyStats();
+
+    // Per-lane shm cursors for every lane this sender owns.
+    std::vector<SenderLane::CursorStats> cursorStats();
 
    private:
     struct PeerLaneEntry {
@@ -435,6 +489,11 @@ class RelayPipeline {
     Status reapInbound(bool& made_progress);
     Status progressInbound(bool& made_progress);
     bool hasInflight() const { return inflight_count_ != 0; }
+    bool hasActiveLane() const;
+    const PxnGeometry& geometryForLog() const { return geometry_; }
+    const LaneHeader& laneHeaderForLog(size_t lane_index) const {
+        return control_->lanes[lane_index].header;
+    }
     void shutdown();
     std::array<LaneSlotStats, kMaxLaneCount> laneSlotStats() const;
     InflightStats inflightStats() const;
@@ -528,6 +587,8 @@ class PxnPump {
     std::condition_variable relay_condition_;
     std::thread sender_thread_;
     std::thread relay_thread_;
+    uint64_t relay_report_ = 0;
+    uint64_t sender_report_ = 0;
 };
 
 std::unique_ptr<StagingBackend> makeCudaRdmaStagingBackend(

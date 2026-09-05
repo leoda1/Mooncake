@@ -146,18 +146,42 @@ Status SenderLane::reap(bool& made_progress) {
 Status SenderLane::progress(bool& made_progress) {
     made_progress = false;
     Status first_error;
+    size_t published_here = 0;
+    size_t queue_depth = 0;
+    {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        queue_depth = queue_.size();
+    }
+    StopReason reason = StopReason::kNone;
     for (size_t count = 0; count < endpoint_.geometry.slots_per_lane; ++count) {
         bool progress = false;
-        auto status = progressOne(progress);
+        bool published = false;
+        auto status = progressOne(progress, published, reason);
         if (first_error.ok() && !status.ok()) first_error = status;
         made_progress = made_progress || progress;
+        if (published) ++published_here;
         if (!status.ok() || !progress) break;
     }
+    ++progress_passes_;
+    published_total_ += published_here;
+    queue_depth_total_ += queue_depth;
+    published_hwm_ = std::max(published_hwm_, published_here);
+    queue_depth_hwm_ = std::max(queue_depth_hwm_, queue_depth);
+    ++stop_reason_[static_cast<size_t>(reason)];
     return first_error;
 }
 
 Status SenderLane::progressOne(bool& made_progress) {
+    StopReason unused = StopReason::kNone;
+    bool published = false;
+    return progressOne(made_progress, published, unused);
+}
+
+Status SenderLane::progressOne(bool& made_progress, bool& published,
+                               StopReason& reason) {
     made_progress = false;
+    published = false;
+    reason = StopReason::kNone;
     Status first_error;
     bool fallback_progress = false;
     auto status = pollFallbacks(fallback_progress);
@@ -168,7 +192,10 @@ Status SenderLane::progressOne(bool& made_progress) {
     status = progressFallbackQueue(fallback_queue_progress);
     if (first_error.ok() && !status.ok()) first_error = status;
     made_progress = made_progress || fallback_queue_progress;
-    if (!fallback_queue_.empty()) return first_error;
+    if (!fallback_queue_.empty()) {
+        reason = StopReason::kFallbackQueue;
+        return first_error;
+    }
 
     if (pending_publication_ != nullptr) {
         bool ready = false;
@@ -186,7 +213,10 @@ Status SenderLane::progressOne(bool& made_progress) {
             made_progress = true;
             return first_error;
         }
-        if (!ready) return first_error;
+        if (!ready) {
+            reason = StopReason::kPendingDoorbell;
+            return first_error;
+        }
         auto pending = std::move(*pending_publication_);
         const uint64_t sequence = pending_sequence_;
         pending_publication_.reset();
@@ -201,13 +231,19 @@ Status SenderLane::progressOne(bool& made_progress) {
     bool use_fallback = quarantine_.quarantined() || next_sequence_ == 0;
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
-        if (queue_.empty()) return first_error;
+        if (queue_.empty()) {
+            reason = StopReason::kQueueEmpty;
+            return first_error;
+        }
         if (!use_fallback &&
             !hasRingCredit(next_sequence_, reaped_sequence_,
                            endpoint_.geometry.slots_per_lane)) {
             const auto elapsed =
                 std::chrono::steady_clock::now() - queue_.front().enqueue_time;
-            if (elapsed < credit_timeout_) return first_error;
+            if (elapsed < credit_timeout_) {
+                reason = StopReason::kNoCredit;
+                return first_error;
+            }
             use_fallback = true;
         }
         queued = std::move(queue_.front());
@@ -232,6 +268,7 @@ Status SenderLane::progressOne(bool& made_progress) {
         return first_error.ok() ? status : first_error;
     }
     made_progress = true;
+    published = true;
     return first_error;
 }
 
@@ -396,7 +433,8 @@ Status SenderLane::publish(QueuedSubmission submission, uint64_t sequence,
                    : fallback_status;
     }
 
-    std::vector<SenderCopy> copies;
+    auto& copies = publish_copies_;
+    copies.clear();
     copies.reserve(submission.submission.piece.spans.size());
     uintptr_t destination = endpoint_.arena_address + slot_offset;
     for (const auto& span : submission.submission.piece.spans) {
@@ -478,7 +516,7 @@ Status SenderPipeline::addPeer(PeerResources& peer, SenderLane*& lane) {
         return Status::OK();
     }
 
-    const auto* control = peer.controlBlock();
+    auto* control = peer.controlBlock();
     SenderLaneEndpoint endpoint{
         peer.entry().epoch,
         peer.address(),
@@ -546,6 +584,59 @@ Status SenderPipeline::progressOutbound(bool& made_progress) {
         return lane->inflightCount() != 0;
     });
     return first_error;
+}
+
+bool SenderPipeline::hasQueuedWork() {
+    std::lock_guard<std::mutex> lock(lanes_mutex_);
+    for (const auto& lane : lanes_) {
+        if (lane->queuedCount() != 0) return true;
+    }
+    return false;
+}
+
+SenderLane::CursorStats SenderLane::cursorStats() const {
+    CursorStats stats{};
+    stats.slots_per_lane = endpoint_.geometry.slots_per_lane;
+    if (endpoint_.control == nullptr ||
+        endpoint_.lane_index >= endpoint_.geometry.lane_count) {
+        return stats;
+    }
+    stats.active = true;
+    const auto& header = endpoint_.control->lanes[endpoint_.lane_index].header;
+    stats.completed = __atomic_load_n(&header.completed, __ATOMIC_ACQUIRE);
+    stats.doorbell = __atomic_load_n(&header.doorbell, __ATOMIC_ACQUIRE);
+    stats.head = __atomic_load_n(&header.head, __ATOMIC_ACQUIRE);
+    stats.cuda_pending =
+        stats.head > stats.doorbell ? stats.head - stats.doorbell : 0;
+    stats.rdma_pending =
+        stats.doorbell > stats.completed ? stats.doorbell - stats.completed : 0;
+    stats.total_pending =
+        stats.head > stats.completed ? stats.head - stats.completed : 0;
+    return stats;
+}
+
+std::vector<SenderLane::CursorStats> SenderPipeline::cursorStats() {
+    std::vector<SenderLane::CursorStats> stats;
+    std::lock_guard<std::mutex> lock(lanes_mutex_);
+    stats.reserve(lanes_.size());
+    for (const auto& lane : lanes_) stats.push_back(lane->cursorStats());
+    return stats;
+}
+
+SenderLane::SupplyStats SenderPipeline::supplyStats() {
+    SenderLane::SupplyStats total{};
+    std::lock_guard<std::mutex> lock(lanes_mutex_);
+    for (const auto& lane : lanes_) {
+        const auto s = lane->supplyStats();
+        total.passes += s.passes;
+        total.published += s.published;
+        total.queue_depth_sum += s.queue_depth_sum;
+        total.published_hwm = std::max(total.published_hwm, s.published_hwm);
+        total.queue_depth_hwm =
+            std::max(total.queue_depth_hwm, s.queue_depth_hwm);
+        for (size_t i = 0; i < s.stops.size(); ++i) total.stops[i] += s.stops[i];
+    }
+    return total;
 }
 
 uint64_t SenderPipeline::fallbackBytes() {

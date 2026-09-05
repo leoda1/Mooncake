@@ -56,11 +56,14 @@ class PxnRdmaTransport : public RdmaTransport {
     struct RelayLane {
         pxn::SenderLane* lane = nullptr;
         uint32_t rail_index = 0;
+        int32_t local_rank_index = -1;
     };
 
     bool selectPxnLane(const TransferRequest& request,
                        SelectionContext& context, std::string& session,
-                       pxn::SenderLane*& lane, uint32_t& rail_index);
+                       pxn::SenderLane*& lane, uint32_t& rail_index,
+                       int32_t& source_rank_index, int32_t& relay_rank_index,
+                       int32_t& destination_rank_index);
 
     std::unique_ptr<pxn::PxnPump> pump_;
     std::unique_ptr<pxn::RelayPipeline> relay_pipeline_;
@@ -69,6 +72,7 @@ class PxnRdmaTransport : public RdmaTransport {
     std::unique_ptr<pxn::RailResolver> rail_resolver_;
     std::mutex peer_mutex_;
     std::unordered_map<std::string, RelayLane> lanes_by_rail_;
+    int32_t local_rank_index_ = -1;
 
     struct PxnStats {
         std::atomic<uint64_t> not_write{0};  // opcode != WRITE or len 0

@@ -194,6 +194,7 @@ Status validateRegistryHeader(const RegistryHeader& header) {
         header.slot_size != config.pxn_slot_size ||
         header.arena_size != geometry.arenaSize() ||
         header.ipc_handle_bytes != kCudaIpcHandleSize ||
+        header.local_rank_index < 0 ||
         !std::all_of(std::begin(header.padding), std::end(header.padding),
                      [](uint8_t byte) { return byte == 0; })) {
         return Status::InvalidArgument("incompatible PXN registry entry");
@@ -411,6 +412,7 @@ Status scanEntriesLocked(int directory_fd, const ProcessProbe& process_probe,
         RegistryEntry entry;
         entry.identity = owner;
         entry.epoch = header->epoch;
+        entry.local_rank_index = header->local_rank_index;
         status = decodeRails(*header, entry.rails);
         if (!status.ok()) {
             munmap(header, sizeof(RegistryHeader));
@@ -461,7 +463,9 @@ Status validateMappedPeer(const ControlBlock& control,
     status = decodeRails(control.header, rails);
     if (!status.ok()) return status;
     if (control.header.owner != entry.identity ||
-        control.header.epoch != entry.epoch || rails != entry.rails ||
+        control.header.epoch != entry.epoch ||
+        control.header.local_rank_index != entry.local_rank_index ||
+        rails != entry.rails ||
         control.header.arena_handle != entry.arena_handle) {
         return Status::InvalidArgument("PXN registry peer changed");
     }
@@ -889,13 +893,14 @@ Status PeerMapping::detachArena() {
 
 Registry::Registry(int root_fd, int directory_fd, int lock_fd,
                    ProcessIdentity identity, uint64_t epoch,
-                   ProcessProbe process_probe,
+                   int32_t local_rank_index, ProcessProbe process_probe,
                    std::shared_ptr<std::mutex> group_mutex)
     : root_fd_(root_fd),
       directory_fd_(directory_fd),
       lock_fd_(lock_fd),
       identity_(identity),
       epoch_(epoch),
+      local_rank_index_(local_rank_index),
       process_probe_(std::move(process_probe)),
       group_mutex_(std::move(group_mutex)) {}
 
@@ -909,6 +914,9 @@ Status Registry::Open(RegistryOptions options,
                       std::unique_ptr<Registry>& registry) {
     if (!isValidGroupId(options.group_id)) {
         return Status::InvalidArgument("invalid PXN registry group");
+    }
+    if (options.local_rank_index < 0) {
+        return Status::InvalidArgument("invalid PXN local rank index");
     }
 
     ProcessIdentity identity{};
@@ -982,6 +990,7 @@ Status Registry::Open(RegistryOptions options,
     const uint64_t epoch = options.epoch == 0 ? generateEpoch() : options.epoch;
     auto group_mutex = std::make_shared<std::mutex>();
     registry.reset(new Registry(root_fd, directory_fd, lock_fd, identity, epoch,
+                                options.local_rank_index,
                                 std::move(process_probe),
                                 std::move(group_mutex)));
     return Status::OK();
@@ -1046,6 +1055,7 @@ Status Registry::createLocal(
     control->header.rail_bytes = static_cast<uint32_t>(encoded_rails.size());
     control->header.rail_count = static_cast<uint32_t>(rails.size());
     control->header.ipc_handle_bytes = kCudaIpcHandleSize;
+    control->header.local_rank_index = local_rank_index_;
     std::memcpy(control->header.rail, encoded_rails.data(),
                 encoded_rails.size());
     control->header.arena_handle = arena_handle;
@@ -1094,6 +1104,7 @@ Status Registry::mapPeer(const RegistryEntry& entry,
                          std::unique_ptr<PeerMapping>& mapping) {
     if (entry.identity.uid != geteuid() || entry.identity.pid <= 0 ||
         entry.identity.start_ticks == 0 || entry.epoch == 0 ||
+        entry.local_rank_index < 0 ||
         entry.file_name != makeEntryName(entry.identity, entry.epoch, false)) {
         return Status::InvalidArgument("invalid PXN peer entry");
     }

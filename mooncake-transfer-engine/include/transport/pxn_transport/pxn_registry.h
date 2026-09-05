@@ -34,7 +34,7 @@ namespace mooncake {
 namespace pxn {
 
 inline constexpr uint64_t kRegistryMagic = 0x4D4350584E524547ULL;
-inline constexpr uint32_t kRegistryAbiVersion = 2;
+inline constexpr uint32_t kRegistryAbiVersion = 3;
 inline constexpr size_t kMaxRailNameLength = 256;
 inline constexpr size_t kCudaIpcHandleSize = 64;
 
@@ -82,7 +82,9 @@ struct alignas(64) RegistryHeader {
     uint32_t rail_count;
     char rail[kMaxRailNameLength];
     CudaIpcHandle arena_handle;
-    uint8_t padding[32];
+    // Logical CUDA device index used as this process's PXN local rank.
+    int32_t local_rank_index;
+    uint8_t padding[28];
 };
 
 struct alignas(64) LaneHeader {
@@ -117,6 +119,7 @@ static_assert(offsetof(RegistryHeader, epoch) == 48);
 static_assert(offsetof(RegistryHeader, lane_count) == 64);
 static_assert(offsetof(RegistryHeader, rail) == 96);
 static_assert(offsetof(RegistryHeader, arena_handle) == 352);
+static_assert(offsetof(RegistryHeader, local_rank_index) == 416);
 static_assert(sizeof(RegistryHeader) == 448);
 static_assert(alignof(LaneHeader) == 64);
 static_assert(offsetof(LaneHeader, sender) == 8);
@@ -140,12 +143,14 @@ struct RegistryOptions {
     std::string group_id;
     std::optional<ProcessIdentity> identity;
     uint64_t epoch = 0;
+    int32_t local_rank_index = -1;
     ProcessProbe process_probe;
 };
 
 struct RegistryEntry {
     ProcessIdentity identity;
     uint64_t epoch;
+    int32_t local_rank_index = -1;
     std::vector<std::string> rails;
     CudaIpcHandle arena_handle;
     std::string file_name;
@@ -239,7 +244,7 @@ class Registry {
 
    private:
     Registry(int root_fd, int directory_fd, int lock_fd,
-             ProcessIdentity identity, uint64_t epoch,
+             ProcessIdentity identity, uint64_t epoch, int32_t local_rank_index,
              ProcessProbe process_probe,
              std::shared_ptr<std::mutex> group_mutex);
 
@@ -248,6 +253,7 @@ class Registry {
     int lock_fd_ = -1;
     ProcessIdentity identity_{};
     uint64_t epoch_ = 0;
+    int32_t local_rank_index_ = -1;
     ProcessProbe process_probe_;
     std::shared_ptr<std::mutex> group_mutex_;
 };
