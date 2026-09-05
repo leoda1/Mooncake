@@ -501,5 +501,52 @@ TEST_F(MaxWrEnvTest, OutOfRangeDoesNotSetFlag) {
     EXPECT_EQ(config.max_wr, 256u);
 }
 
+class PxnGeometryEnvTest : public ::testing::Test {
+   protected:
+    void SetUp() override { clear(); }
+    void TearDown() override { clear(); }
+
+    void clear() {
+        ::unsetenv("MC_PXN_LANE_COUNT");
+        ::unsetenv("MC_PXN_SLOTS_PER_LANE");
+        ::unsetenv("MC_PXN_SLOT_SIZE");
+    }
+};
+
+TEST_F(PxnGeometryEnvTest, DefaultsMatchStagingGeometry) {
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.pxn_lane_count, 7u);
+    EXPECT_EQ(config.pxn_slots_per_lane, 18u);
+    EXPECT_EQ(config.pxn_slot_size, 512u * 1024u);
+}
+
+TEST_F(PxnGeometryEnvTest, ValidOverridesAreApplied) {
+    ASSERT_EQ(::setenv("MC_PXN_LANE_COUNT", "4", 1), 0);
+    ASSERT_EQ(::setenv("MC_PXN_SLOTS_PER_LANE", "12", 1), 0);
+    ASSERT_EQ(::setenv("MC_PXN_SLOT_SIZE", "262144", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.pxn_lane_count, 4u);
+    EXPECT_EQ(config.pxn_slots_per_lane, 12u);
+    EXPECT_EQ(config.pxn_slot_size, 256u * 1024u);
+}
+
+TEST_F(PxnGeometryEnvTest, ValuesBeyondFixedCapacityAreRejected) {
+    ASSERT_EQ(::setenv("MC_PXN_LANE_COUNT", "8", 1), 0);
+    ASSERT_EQ(::setenv("MC_PXN_SLOTS_PER_LANE", "19", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.pxn_lane_count, 7u);
+    EXPECT_EQ(config.pxn_slots_per_lane, 18u);
+}
+
+TEST_F(PxnGeometryEnvTest, ZeroSlotSizeIsRejected) {
+    ASSERT_EQ(::setenv("MC_PXN_SLOT_SIZE", "0", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.pxn_slot_size, 512u * 1024u);
+}
+
 }  // namespace
 }  // namespace mooncake

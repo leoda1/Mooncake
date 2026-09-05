@@ -207,6 +207,14 @@ int TEBenchRunner::freeBuffers() {
 TEBenchRunner::TEBenchRunner() {
     signal(SIGINT, signalHandlerV0);
     signal(SIGTERM, signalHandlerV0);
+#if defined(USE_CUDA)
+    if (XferBenchConfig::local_gpu_id > 0) {
+        auto error = cudaSetDevice(XferBenchConfig::local_gpu_id);
+        LOG_IF(WARNING, error != cudaSuccess)
+            << "cudaSetDevice(" << XferBenchConfig::local_gpu_id
+            << ") failed before engine creation: " << cudaGetErrorString(error);
+    }
+#endif
     engine_ = std::make_unique<mooncake::TransferEngine>(true);
     auto conn_str = XferBenchConfig::metadata_type == "p2p"
                         ? "P2PHANDSHAKE"

@@ -1469,6 +1469,11 @@ int RdmaContext::submitPostSend(
     return worker_pool_->submitPostSend(slice_list);
 }
 
+int RdmaContext::submitPreparedPostSend(
+    const std::vector<Transport::Slice *> &slice_list) {
+    return worker_pool_->submitPreparedPostSend(slice_list);
+}
+
 void RdmaContext::trackPostedSlices(
     const std::vector<Transport::Slice *> &slice_list, size_t first,
     size_t count) {

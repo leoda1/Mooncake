@@ -285,6 +285,8 @@ class RdmaContext {
 
    public:
     int submitPostSend(const std::vector<Transport::Slice *> &slice_list);
+    int submitPreparedPostSend(
+        const std::vector<Transport::Slice *> &slice_list);
 
     void trackPostedSlices(const std::vector<Transport::Slice *> &slice_list,
                            size_t first, size_t count);

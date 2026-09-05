@@ -74,6 +74,20 @@ struct GlobalConfig {
     // Cooldown before retrying a failed RDMA peer rail. Override via
     // MC_RDMA_RAIL_PAUSE_SECONDS.
     uint64_t rdma_rail_pause_seconds = 30;
+    // Runtime PXN controls. Timeout values are ms.
+    bool pxn_enable = false;
+    std::string pxn_group_id;
+    // Runtime-active PXN staging geometry. The lane and slot counts are
+    // bounded by the fixed-capacity shared-memory control block.
+    size_t pxn_lane_count = 7;
+    size_t pxn_slots_per_lane = 18;
+    size_t pxn_slot_size = 512ULL * 1024;
+    // A 512 KiB PXN slot needs a deeper relay window to overlap CUDA staging
+    // with the second-hop RDMA latency. This remains bounded by the slot rings.
+    size_t pxn_inflight_depth = 64;
+    std::unordered_map<std::string, std::string> pxn_rail_map;
+    uint32_t pxn_credit_timeout_ms = 1000;
+    uint32_t pxn_heartbeat_timeout_ms = 3000;
     bool metacache = true;
     // Periodically refresh Transfer Engine metadata-derived local caches. 0
     // disables the background poller and preserves the manual

@@ -10,7 +10,8 @@ if(USE_HIP)
   hipify_files(ENGINE_SOURCES)
 endif()
 
-add_library(transfer_engine ${ENGINE_SOURCES} $<TARGET_OBJECTS:transport>)
+add_library(transfer_engine ${ENGINE_SOURCES} $<TARGET_OBJECTS:transport>
+                                  $<TARGET_OBJECTS:pxn_transport>)
 # Private headers live next to the .cpp sources. USE_HIP hipifies into the build
 # tree and needs this path explicitly.
 target_include_directories(transfer_engine
